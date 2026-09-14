@@ -40,7 +40,7 @@ def options():
 def run_calculator():
     print("AI Math Calculator")
     while True:
-        #options()
+        options()
         choice = input("\n\n\nEnter your choice (1-6): ")
         match choice:
             case "1":
