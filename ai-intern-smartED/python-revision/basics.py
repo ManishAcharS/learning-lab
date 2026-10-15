@@ -19,8 +19,9 @@ for i in range(1,11):
     for j in range(1,11):
         print(f"{i} X {j} = {i*j}")
     print()
-1 = [1,23,43,534,32]
+l = [1,23,43,534,32]
 total = 0
 for i in l:
     total += i
 print(total)
+print([i*2 for i in l if i % 2== 0])
