@@ -15,4 +15,12 @@ print(l)
 l = ["manish", "cs"]
 for i in enumerate(l):
     print(i)
-
+for i in range(1,11):
+    for j in range(1,11):
+        print(f"{i} X {j} = {i*j}")
+    print()
+1 = [1,23,43,534,32]
+total = 0
+for i in l:
+    total += i
+print(total)
