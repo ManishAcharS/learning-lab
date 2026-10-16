@@ -25,3 +25,18 @@ for i in l:
     total += i
 print(total)
 print([i*2 for i in l if i % 2== 0])
+print([i*2 for i in range(1,11) if i % 2 == 0])
+a = "abc$43"
+print(a.isalnum())
+i = [int(n) for n in input("i> ").split()]
+sum=0
+for j in i :
+    sum+= j
+print (i,sum)
+d = {
+    "name" : "manish",
+    "age" : 17,
+    "add" : "banglure"
+}
+dl = {key:val for key,val in d.items()}
+print(d,dl)
