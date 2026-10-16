@@ -40,3 +40,9 @@ d = {
 }
 dl = {key:val for key,val in d.items()}
 print(d,dl)
+l = [1, 2 ,3, 4, 5, 6, 7, 8, 9, 0]
+print((100*101)/2)
+t = 0
+for i in range(1,101):
+    t += i
+print(t)
