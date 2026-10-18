@@ -52,13 +52,59 @@ class a():
         self.age = age
     def display(self):
         print(f"name : {self.__name} \nage : {self.age}")
-m = a("manish", 17)
-m.display()
-class b(a):
     def edit(self,name,age):
         self.__name = name
         self.age = age
+
+m = a("manish", 17)
+m.display()
+class b(a):
+    def dis(self, i):
+        super().display()
+        if i <= 0:
+            return
+        i = i - 1
+        self.dis(i)
+
+
 mm= b("man", 16)
 mm.display()
 mm.edit("mmm",11)
 mm.display()
+mm.dis(20)
+#menu driven program
+def menu():
+    print("1. Add")
+    print("2. Subtract")
+    print("3. Multiply")
+    print("4. Divide")
+    print("5. Exit")
+def add(a,b):
+    return a+b
+def sub(a,b):
+    return a-b
+def mul(a,b):
+    return a*b
+def div(a,b):
+    if b == 0:
+        return "Error: Division by zero"
+    return a/b
+while True:
+    menu()
+    choice = input("Enter your choice: ")
+    if choice == '5':
+        print("Exiting the program.")
+        break
+    num1 = float(input("Enter first number: "))
+    num2 = float(input("Enter second number: "))
+
+    if choice == '1':
+        print(f"Result: {add(num1, num2)}")
+    elif choice == '2':
+        print(f"Result: {sub(num1, num2)}")
+    elif choice == '3':
+        print(f"Result: {mul(num1, num2)}")
+    elif choice == '4':
+        print(f"Result: {div(num1, num2)}")
+    else:
+        print("Invalid choice. Please try again.")
