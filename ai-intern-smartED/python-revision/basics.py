@@ -28,11 +28,11 @@ print([i*2 for i in l if i % 2== 0])
 print([i*2 for i in range(1,11) if i % 2 == 0])
 a = "abc$43"
 print(a.isalnum())
-i = [int(n) for n in input("i> ").split()]
-sum=0
-for j in i :
-    sum+= j
-print (i,sum)
+# i = [int(n) for n in input("i> ").split()]
+# sum=0
+# for j in i :
+#     sum+= j
+# print (i,sum)
 d = {
     "name" : "manish",
     "age" : 17,
@@ -46,3 +46,19 @@ t = 0
 for i in range(1,101):
     t += i
 print(t)
+class a():
+    def __init__(self, name , age):
+        self.__name = name
+        self.age = age
+    def display(self):
+        print(f"name : {self.__name} \nage : {self.age}")
+m = a("manish", 17)
+m.display()
+class b(a):
+    def edit(self,name,age):
+        self.__name = name
+        self.age = age
+mm= b("man", 16)
+mm.display()
+mm.edit("mmm",11)
+mm.display()
