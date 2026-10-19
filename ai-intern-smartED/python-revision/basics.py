@@ -89,22 +89,24 @@ def div(a,b):
     if b == 0:
         return "Error: Division by zero"
     return a/b
-while True:
-    menu()
-    choice = input("Enter your choice: ")
-    if choice == '5':
-        print("Exiting the program.")
-        break
-    num1 = float(input("Enter first number: "))
-    num2 = float(input("Enter second number: "))
+# while True:
+#     menu()
+#     choice = input("Enter your choice: ")
+#     if choice == '5':
+#         print("Exiting the program.")
+#         break
+#     num1 = float(input("Enter first number: "))
+#     num2 = float(input("Enter second number: "))
 
-    if choice == '1':
-        print(f"Result: {add(num1, num2)}")
-    elif choice == '2':
-        print(f"Result: {sub(num1, num2)}")
-    elif choice == '3':
-        print(f"Result: {mul(num1, num2)}")
-    elif choice == '4':
-        print(f"Result: {div(num1, num2)}")
-    else:
-        print("Invalid choice. Please try again.")
+#     if choice == '1':
+#         print(f"Result: {add(num1, num2)}")
+#     elif choice == '2':
+#         print(f"Result: {sub(num1, num2)}")
+#     elif choice == '3':
+#         print(f"Result: {mul(num1, num2)}")
+#     elif choice == '4':
+#         print(f"Result: {div(num1, num2)}")
+#     else:
+#         print("Invalid choice. Please try again.")
+with open("a.txt", "w") as f:
+    f.write("abcdefghijklmnopqrstuvwxyz")
