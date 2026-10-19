@@ -110,3 +110,11 @@ def div(a,b):
 #         print("Invalid choice. Please try again.")
 with open("a.txt", "w") as f:
     f.write("abcdefghijklmnopqrstuvwxyz")
+nums = [1, 2, 3, 4, 5]
+str_nums = list(map(lambda x: str(x)*2, nums))
+print(str_nums)
+import sys
+generator = (x for x in range(1000))
+generator_list = [x for x in range(1000)]
+print(sys.getsizeof(generator))
+print(sys.getsizeof(generator_list))
