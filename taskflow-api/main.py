@@ -1,4 +1,6 @@
 from fastapi import FastAPI
+from pydantic import BaseModel, Field
+
 app = FastAPI(title="Taskflow API")
 
 @app.get("/health")
@@ -16,3 +18,18 @@ tasks = [
 @app.get("/tasks")
 def get_tasks():
     return tasks
+
+class TaskCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=100)
+    completed: bool = False
+
+@app.post("/tasks", status_code=201)
+def create_task(task : TaskCreate):
+    new_task = {
+        "id": len(tasks) + 1,
+        "title": task.title,
+        "completed": task.completed
+    }
+    tasks.append(new_task)
+    return new_task
+
