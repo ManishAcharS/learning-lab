@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 app = FastAPI(title="Taskflow API")
 
@@ -37,11 +37,20 @@ class TaskUpdate(BaseModel):
     title: str | None = Field(default=None, min_length=1, max_length=100)
     completed: bool | None = None
 
+    @field_validator("title", "completed")
+    @classmethod
+    def reject_explicit_null(cls, value):
+        # Omitted fields never reach this validator, so partial updates still
+        # leave them unchanged. An explicit JSON null, however, is rejected.
+        if value is None:
+            raise ValueError("must not be null; omit the field to leave it unchanged")
+        return value
+
 
 @app.post("/tasks", status_code=201)
 def create_task(task: TaskCreate):
     new_task = {
-        "id": len(tasks) + 1,
+        "id": max((existing["id"] for existing in tasks), default=0) + 1,
         "title": task.title,
         "completed": task.completed
     }
@@ -81,3 +90,4 @@ def delete_task(task_id: int):
             return
 
     raise HTTPException(status_code=404, detail="Task not found")
+
