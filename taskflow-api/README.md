@@ -1,9 +1,9 @@
 # TaskFlow API
 
-A small task-management REST API built with FastAPI and Pydantic. It supports
-listing, creating, retrieving, partially updating, and deleting tasks. Tasks are
-kept in memory, so this project is intended for learning and local experiments
-rather than production use.
+A small task-management REST API built with FastAPI, Pydantic 2, the
+SQLAlchemy 2.x ORM, and SQLite. It supports listing, creating, retrieving,
+partially updating, and deleting tasks. Tasks are persisted in
+`taskflow.db`, so they survive an application restart.
 
 ## Request lifecycle
 
@@ -13,25 +13,89 @@ rather than production use.
    body before the endpoint runs. Invalid input (for example, a missing or empty
    title, or an explicit `null`) produces an automatic `422 Unprocessable
    Entity` response, and the endpoint is not called.
-4. The endpoint reads or mutates the module-level `tasks` list in `main.py`.
-   Task lookups use `_find_task`; an unknown ID raises `HTTPException(404)`.
-5. FastAPI serializes the returned Python dictionary to JSON and sends it with
-   the route's status code (`200`, `201`, or `204`).
-
-In short:
+4. FastAPI resolves the `get_db` dependency, which opens one SQLAlchemy session
+   for the request and promises to close it afterward.
+5. The endpoint uses that session to read or modify `Task` ORM objects. Writes
+   are committed only after validation succeeds; created or updated objects are
+   refreshed so database defaults are available. An unknown ID raises
+   `HTTPException(404)`.
+6. FastAPI serializes the ORM object through the `TaskRead` response model and
+   sends it with the route's status code (`200`, `201`, or `204`).
+7. The `get_db` dependency closes the session in a `finally` block, even when
+   the endpoint raises an exception.
 
 ```text
-Client -> Uvicorn -> FastAPI router -> Pydantic validation -> endpoint
-       <- JSON response <- FastAPI serialization <- in-memory tasks
+Client -> Uvicorn -> FastAPI router -> Pydantic validation
+       -> get_db dependency (Session) -> SQLAlchemy ORM -> SQLite
+       <- JSON response <- TaskRead <- session closed in finally
 ```
+
+## Database layer
+
+| File | Responsibility |
+| --- | --- |
+| `database.py` | Stable database path, SQLAlchemy engine, `SessionLocal`, declarative `Base`, `get_db`, and `init_db`. |
+| `models.py` | The `Task` ORM model mapped to the `tasks` table. |
+| `main.py` | FastAPI app, request/response schemas, and ORM-based endpoints. |
+| `test_main.py` | API tests, each using an isolated temporary SQLite database. |
+
+The database URL is built from `Path(__file__).resolve().parent`, so
+`taskflow.db` is always the file next to the application code, regardless of the
+terminal's current working directory.
+
+### ORM model
+
+`models.Task` maps to the `tasks` table:
+
+| Column | Type | Rules |
+| --- | --- | --- |
+| `id` | `INTEGER` | Primary key, auto-incrementing (`AUTOINCREMENT`, so deleted IDs are not reused). |
+| `title` | `VARCHAR(100)` | Required; a database `CHECK` also enforces 1–100 characters. |
+| `completed` | `BOOLEAN` | Required; defaults to `false` (`0` in SQLite). |
+| `created_at` | `DATETIME` | Required; defaults to the database's `CURRENT_TIMESTAMP`. |
+
+The ORM model is the persistence model: it describes the table and its
+constraints. The Pydantic models are transport models: `TaskCreate` and
+`TaskUpdate` validate incoming JSON, while `TaskRead` controls the response
+shape. `TaskRead` uses `from_attributes=True` to serialize ORM objects, and it
+intentionally exposes only `id`, `title`, and `completed`; `created_at` is stored
+but not part of the existing API response.
+
+### Table creation and existing data
+
+`init_db()` runs during FastAPI startup and calls
+`Base.metadata.create_all(bind=engine)`. This only creates missing tables. It
+does **not** add columns, change types, or otherwise migrate an existing table.
+
+The existing `taskflow.db` was inspected before these changes. Its `tasks` table
+already has `id`, `title`, `completed`, and `created_at` with compatible
+constraints and defaults, and it contains three practice rows. No migration was
+needed, and the file and its data were left intact. If the schema must change in
+the future, back up `taskflow.db` and apply a deliberate migration (for example,
+with Alembic or reviewed SQL); do not delete the database to force a new schema.
+
+### Session lifecycle
+
+1. FastAPI calls `get_db()` while resolving the request.
+2. `get_db()` creates a session from `SessionLocal` and yields it to the endpoint.
+3. Reads use `db.get(...)` or `db.scalars(select(...))`; writes call
+   `db.add(...)`, `db.delete(...)`, and `db.commit()`.
+4. After a successful create or update, `db.refresh(...)` reloads the row so
+   database-generated values are current.
+5. The `finally` block always calls `db.close()`. Closing an uncommitted session
+   rolls back its pending transaction, so a rejected request does not persist
+   partial changes.
+
+Using a dependency keeps sessions request-scoped rather than global, guarantees
+cleanup, and lets tests replace the real database session with an isolated one.
 
 ## Endpoints
 
 | Method | Path | Purpose | Success status |
 | --- | --- | --- | --- |
 | `GET` | `/health` | Check that the API is running and healthy. | `200` |
-| `GET` | `/tasks` | List every task. | `200` |
-| `POST` | `/tasks` | Create a task from a `title` and optional `completed` value. The server assigns the ID. | `201` |
+| `GET` | `/tasks` | List every task from SQLite, ordered by ID. | `200` |
+| `POST` | `/tasks` | Create a task from a `title` and optional `completed` value. The database assigns the ID. | `201` |
 | `GET` | `/tasks/{task_id}` | Retrieve one task by ID. | `200` |
 | `PATCH` | `/tasks/{task_id}` | Partially update `title` and/or `completed`. Omitted fields are left unchanged. | `200` |
 | `DELETE` | `/tasks/{task_id}` | Delete a task by ID. | `204` |
@@ -67,34 +131,20 @@ curl -X DELETE http://127.0.0.1:8000/tasks/1
 Interactive API documentation is available at `/docs` (Swagger UI) and
 `/redoc` while the server is running.
 
-## Current limitations
-
-- **No persistence.** Tasks live in the module-level `tasks` list and reset to
-  the two seed tasks whenever the process restarts.
-- **No database.** There is no storage layer, migrations, or transaction
-  handling.
-- **No authentication or authorization.** Every caller can read and modify all
-  tasks.
-- **No concurrency control.** Concurrent requests mutate a shared list without
-  locking, so behavior under parallel writes is not guaranteed.
-- **Basic ID generation.** New IDs are `max(existing IDs) + 1`. Deleting the
-  task with the highest ID can cause that ID to be reused later.
-- **No pagination, filtering, sorting, or search.** `GET /tasks` always returns
-  the full list.
-- **Single-resource updates only.** There is no bulk create/update/delete.
-- **Minimal error handling.** Besides FastAPI's validation responses and the
-  `404` for unknown tasks, there is no custom error envelope or logging.
-
 ## Project structure
 
 ```text
 taskflow-api/
-|-- main.py        # FastAPI app, models, and in-memory task store
-|-- test_main.py   # API tests using FastAPI's TestClient and pytest
+|-- main.py              # FastAPI app, Pydantic schemas, CRUD endpoints
+|-- database.py          # Engine, Base, SessionLocal, get_db, init_db
+|-- models.py            # Task SQLAlchemy ORM model
+|-- test_main.py         # API tests with isolated temporary databases
+|-- database_practice.py # Standalone sqlite3 practice script (unchanged)
+|-- taskflow.db          # Development SQLite database
 `-- README.md
 ```
 
-## Running the tests
+## Setup and running the tests
 
 From the `taskflow-api` directory, create and activate a virtual environment,
 install the dependencies, and run pytest:
@@ -102,18 +152,23 @@ install the dependencies, and run pytest:
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install fastapi uvicorn pytest httpx
+python -m pip install fastapi uvicorn pytest httpx "SQLAlchemy>=2.0"
 python -m pytest -v
 ```
 
 On macOS or Linux, activate the environment with
 `source .venv/bin/activate` instead.
 
-Each test starts from a known copy of the seed tasks and restores the original
-list afterward, so tests do not depend on execution order. The suite covers the
-health check, task listing and retrieval, creation and validation, partial
-updates, rejection of explicit `null` values, unique ID generation after a
-deletion, and deletion behavior.
+The suite currently contains 13 tests. Each test creates a fresh SQLite file
+under pytest's `tmp_path`, creates the schema from the ORM metadata, seeds two
+known tasks, and installs a `get_db` dependency override. The temporary database
+is discarded afterward, so tests never delete or modify the real
+`taskflow.db`, and one test cannot leak state into another.
+
+The tests cover the health check, task listing and retrieval, creation and
+validation, partial updates, rejection of explicit `null` values, unique ID
+generation after deletion (including deletion of the highest ID), and deletion
+behavior.
 
 ## Running the API locally
 
@@ -122,5 +177,20 @@ deletion, and deletion behavior.
 uvicorn main:app --reload
 ```
 
-Then open <http://127.0.0.1:8000/docs> or call the endpoints at
+On startup, missing tables are created in `taskflow.db`. Then open
+<http://127.0.0.1:8000/docs> or call the endpoints at
 <http://127.0.0.1:8000>.
+
+## Current limitations
+
+- **No authentication or authorization.** Every caller can read and modify all
+  tasks.
+- **No migration framework.** `create_all()` only creates missing tables;
+  changing an existing schema requires a separate migration.
+- **SQLite only.** The project is intended for local learning and small
+  workloads, not for high-concurrency or multi-server deployment.
+- **No pagination, filtering, sorting, or search.** `GET /tasks` always returns
+  the full table.
+- **Single-resource updates only.** There is no bulk create/update/delete.
+- **Minimal error handling.** Besides FastAPI's validation responses and the
+  `404` for unknown tasks, there is no custom error envelope or logging.

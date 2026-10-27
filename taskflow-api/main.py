@@ -1,7 +1,26 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field, field_validator
+from contextlib import asynccontextmanager
+from typing import Annotated
 
-app = FastAPI(title="Taskflow API")
+from fastapi import Depends, FastAPI, HTTPException
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from database import get_db, init_db
+from models import Task
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Create missing tables when the application starts. Existing tables are
+    # left untouched; create_all does not perform schema migrations.
+    init_db()
+    yield
+
+
+app = FastAPI(title="Taskflow API", lifespan=lifespan)
+
+DbSession = Annotated[Session, Depends(get_db)]
 
 
 @app.get("/health")
@@ -10,22 +29,6 @@ def health():
         "status": "healthy",
         "message": "TaskFlow api is running"
     }
-
-
-# Tasks live in memory and are reset whenever the API process restarts.
-tasks = [
-    {"id": 1, "title": "Learn FastAPI", "completed": False},
-    {"id": 2, "title": "Build my first API", "completed": False}
-]
-
-
-def _find_task(task_id: int):
-    return next((task for task in tasks if task["id"] == task_id), None)
-
-
-@app.get("/tasks")
-def get_tasks():
-    return tasks
 
 
 class TaskCreate(BaseModel):
@@ -47,20 +50,33 @@ class TaskUpdate(BaseModel):
         return value
 
 
-@app.post("/tasks", status_code=201)
-def create_task(task: TaskCreate):
-    new_task = {
-        "id": max((existing["id"] for existing in tasks), default=0) + 1,
-        "title": task.title,
-        "completed": task.completed
-    }
-    tasks.append(new_task)
+class TaskRead(BaseModel):
+    """Response shape for a task; created_at stays internal to the database."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    title: str
+    completed: bool
+
+
+@app.get("/tasks", response_model=list[TaskRead])
+def get_tasks(db: DbSession):
+    return db.scalars(select(Task).order_by(Task.id)).all()
+
+
+@app.post("/tasks", response_model=TaskRead, status_code=201)
+def create_task(task: TaskCreate, db: DbSession):
+    new_task = Task(title=task.title, completed=task.completed)
+    db.add(new_task)
+    db.commit()
+    db.refresh(new_task)
     return new_task
 
 
-@app.get("/tasks/{task_id}")
-def get_task(task_id: int):
-    task = _find_task(task_id)
+@app.get("/tasks/{task_id}", response_model=TaskRead)
+def get_task(task_id: int, db: DbSession):
+    task = db.get(Task, task_id)
     if task is not None:
         return task
 
@@ -70,24 +86,28 @@ def get_task(task_id: int):
     )
 
 
-@app.patch("/tasks/{task_id}")
-def update_task(task_id: int, update: TaskUpdate):
-    task = _find_task(task_id)
+@app.patch("/tasks/{task_id}", response_model=TaskRead)
+def update_task(task_id: int, update: TaskUpdate, db: DbSession):
+    task = db.get(Task, task_id)
     if task is not None:
         # Keep omitted fields unchanged during a partial update.
         changes = update.model_dump(exclude_unset=True)
-        task.update(changes)
+        for field, value in changes.items():
+            setattr(task, field, value)
+
+        db.commit()
+        db.refresh(task)
         return task
 
     raise HTTPException(status_code=404, detail="Task not found")
 
 
 @app.delete("/tasks/{task_id}", status_code=204)
-def delete_task(task_id: int):
-    for index, task in enumerate(tasks):
-        if task["id"] == task_id:
-            tasks.pop(index)
-            return
+def delete_task(task_id: int, db: DbSession):
+    task = db.get(Task, task_id)
+    if task is not None:
+        db.delete(task)
+        db.commit()
+        return
 
     raise HTTPException(status_code=404, detail="Task not found")
-

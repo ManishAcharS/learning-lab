@@ -1,13 +1,13 @@
 """Tests for the TaskFlow FastAPI application."""
 
-import copy
-
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
 import main
-
-client = TestClient(main.app)
+from database import Base, get_db
+from models import Task
 
 SEED_TASKS = [
     {"id": 1, "title": "Learn FastAPI", "completed": False},
@@ -15,21 +15,58 @@ SEED_TASKS = [
 ]
 
 
-@pytest.fixture(autouse=True)
-def isolated_task_store():
-    """Give each test the seed data, then restore the original in-memory list.
+@pytest.fixture
+def client(tmp_path):
+    """Run each test against its own temporary SQLite database.
 
-    ``main.tasks`` is a module-level list, so every test shares it. Copying the
-    list before and after each test keeps tests independent of execution order
-    and prevents one test's changes from leaking into another.
+    The production ``taskflow.db`` is never opened. A dependency override
+    points the API at a fresh database file under pytest's ``tmp_path``, and
+    the file is discarded when the test finishes.
     """
-    original = copy.deepcopy(main.tasks)
-    main.tasks[:] = copy.deepcopy(SEED_TASKS)
-    yield
-    main.tasks[:] = original
+    test_database = tmp_path / "test_taskflow.db"
+    test_engine = create_engine(
+        f"sqlite:///{test_database.as_posix()}",
+        connect_args={"check_same_thread": False},
+    )
+    TestingSessionLocal = sessionmaker(
+        bind=test_engine,
+        autoflush=False,
+        expire_on_commit=False,
+    )
+    Base.metadata.create_all(bind=test_engine)
+
+    with TestingSessionLocal() as session:
+        session.add_all(
+            Task(
+                id=task["id"],
+                title=task["title"],
+                completed=task["completed"],
+            )
+            for task in SEED_TASKS
+        )
+        session.commit()
+
+    def override_get_db():
+        session = TestingSessionLocal()
+        try:
+            yield session
+        finally:
+            session.close()
+
+    main.app.dependency_overrides[get_db] = override_get_db
+    # Entering the TestClient as a context manager would run the app lifespan,
+    # which initializes the real development database. These tests create their
+    # own schema, so they use the client without triggering that startup hook.
+    test_client = TestClient(main.app)
+    try:
+        yield test_client
+    finally:
+        test_client.close()
+        main.app.dependency_overrides.pop(get_db, None)
+        test_engine.dispose()
 
 
-def test_health_returns_200():
+def test_health_returns_200(client):
     """The health endpoint should be reachable and report a healthy status."""
     response = client.get("/health")
 
@@ -40,7 +77,7 @@ def test_health_returns_200():
     }
 
 
-def test_get_tasks_returns_expected_tasks():
+def test_get_tasks_returns_expected_tasks(client):
     """The task list should contain exactly the seeded tasks."""
     response = client.get("/tasks")
 
@@ -48,7 +85,7 @@ def test_get_tasks_returns_expected_tasks():
     assert response.json() == SEED_TASKS
 
 
-def test_create_task_returns_201():
+def test_create_task_returns_201(client):
     """Posting a valid task should create it with a server-assigned ID."""
     response = client.post(
         "/tasks",
@@ -70,7 +107,7 @@ def test_create_task_returns_201():
     [{}, {"title": ""}],
     ids=["missing-title", "empty-title"],
 )
-def test_create_task_rejects_invalid_title(payload):
+def test_create_task_rejects_invalid_title(client, payload):
     """A missing or empty title should fail validation with 422."""
     response = client.post("/tasks", json=payload)
 
@@ -78,7 +115,7 @@ def test_create_task_rejects_invalid_title(payload):
     assert len(client.get("/tasks").json()) == len(SEED_TASKS)
 
 
-def test_get_task_returns_existing_task():
+def test_get_task_returns_existing_task(client):
     """Fetching a seeded task ID should return that task."""
     response = client.get("/tasks/2")
 
@@ -86,7 +123,7 @@ def test_get_task_returns_existing_task():
     assert response.json() == SEED_TASKS[1]
 
 
-def test_get_task_returns_404_for_unknown_id():
+def test_get_task_returns_404_for_unknown_id(client):
     """Fetching an ID that does not exist should return 404."""
     response = client.get("/tasks/999")
 
@@ -94,7 +131,7 @@ def test_get_task_returns_404_for_unknown_id():
     assert response.json() == {"detail": "Task not found"}
 
 
-def test_patch_task_updates_only_supplied_fields():
+def test_patch_task_updates_only_supplied_fields(client):
     """A partial update should change only the fields present in the body."""
     # Change only completed; title must stay the same.
     response = client.patch("/tasks/1", json={"completed": True})
@@ -126,7 +163,7 @@ def test_patch_task_updates_only_supplied_fields():
 
 
 @pytest.mark.parametrize("field", ["title", "completed"])
-def test_patch_task_rejects_explicit_null(field):
+def test_patch_task_rejects_explicit_null(client, field):
     """An explicit null must fail validation instead of clearing a field."""
     before = client.get("/tasks/1").json()
 
@@ -140,7 +177,7 @@ def test_patch_task_rejects_explicit_null(field):
     assert client.get("/tasks").json() == SEED_TASKS
 
 
-def test_create_task_uses_unique_id_after_deletion():
+def test_create_task_uses_unique_id_after_deletion(client):
     """Deleting a task must not cause the next created task to reuse an ID."""
     assert client.delete("/tasks/1").status_code == 204
 
@@ -154,7 +191,17 @@ def test_create_task_uses_unique_id_after_deletion():
     assert len(task_ids) == len(set(task_ids))
 
 
-def test_delete_task_returns_204_then_404():
+def test_create_task_does_not_reuse_highest_id(client):
+    """AUTOINCREMENT prevents reuse even after deleting the highest ID."""
+    assert client.delete("/tasks/2").status_code == 204
+
+    response = client.post("/tasks", json={"title": "Another task"})
+
+    assert response.status_code == 201
+    assert response.json()["id"] == 3
+
+
+def test_delete_task_returns_204_then_404(client):
     """Deleting a task should return 204; deleting it again should return 404."""
     response = client.delete("/tasks/1")
 
