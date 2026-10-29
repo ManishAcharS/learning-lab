@@ -1,5 +1,5 @@
 from contextlib import asynccontextmanager
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -60,9 +60,41 @@ class TaskRead(BaseModel):
     completed: bool
 
 
+SortField = Literal["id", "title", "completed"]
+SortOrder = Literal["asc", "desc"]
+
+# Explicit whitelist: clients choose a name, never a SQL expression.
+SORT_COLUMNS = {
+    "id": Task.id,
+    "title": Task.title,
+    "completed": Task.completed,
+}
+
+
 @app.get("/tasks", response_model=list[TaskRead])
-def get_tasks(db: DbSession):
-    return db.scalars(select(Task).order_by(Task.id)).all()
+def get_tasks(
+    db: DbSession,
+    completed: bool | None = None,
+    sort_by: SortField = "id",
+    sort_order: SortOrder = "asc",
+):
+    statement = select(Task)
+
+    # Filter in SQL; False must still apply, so compare explicitly to None.
+    if completed is not None:
+        statement = statement.where(Task.completed == completed)
+
+    sort_column = SORT_COLUMNS[sort_by]
+    if sort_order == "asc":
+        statement = statement.order_by(sort_column.asc())
+    else:
+        statement = statement.order_by(sort_column.desc())
+
+    # Ties get a stable, predictable order without changing the requested sort.
+    if sort_by != "id":
+        statement = statement.order_by(Task.id.asc())
+
+    return db.scalars(statement).all()
 
 
 @app.post("/tasks", response_model=TaskRead, status_code=201)

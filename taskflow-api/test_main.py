@@ -85,6 +85,107 @@ def test_get_tasks_returns_expected_tasks(client):
     assert response.json() == SEED_TASKS
 
 
+def test_get_tasks_without_filter_returns_all_tasks(client):
+    """Omitting the filter should preserve the original list behavior."""
+    response = client.get("/tasks")
+
+    assert response.status_code == 200
+    assert response.json() == SEED_TASKS
+
+
+def test_get_tasks_filters_by_completed_true(client):
+    """completed=true should return only completed tasks."""
+    created = client.post(
+        "/tasks",
+        json={"title": "Write tests", "completed": True},
+    ).json()
+
+    response = client.get("/tasks", params={"completed": "true"})
+
+    assert response.status_code == 200
+    assert response.json() == [created]
+
+
+def test_get_tasks_filters_by_completed_false(client):
+    """completed=false should return only incomplete tasks."""
+    response = client.get("/tasks", params={"completed": "false"})
+
+    assert response.status_code == 200
+    assert response.json() == SEED_TASKS
+
+
+def test_get_tasks_filter_returns_empty_list_when_no_task_matches(client):
+    """A filter that matches nothing should return [], not 404."""
+    response = client.get("/tasks", params={"completed": "true"})
+
+    assert response.status_code == 200
+    assert response.json() == []
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["not-a-boolean", "", "2"],
+    ids=["text", "empty", "integer"],
+)
+def test_get_tasks_rejects_invalid_completed_filter(client, value):
+    """A value that is not a boolean should fail query validation."""
+    response = client.get("/tasks", params={"completed": value})
+
+    assert response.status_code == 422
+    assert any(
+        error["loc"] == ["query", "completed"]
+        for error in response.json()["detail"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("sort_by", "sort_order", "expected_ids"),
+    [
+        ("id", "asc", [1, 2, 3]),
+        ("id", "desc", [3, 2, 1]),
+        ("title", "asc", [2, 1, 3]),
+        ("title", "desc", [3, 1, 2]),
+        ("completed", "asc", [1, 2, 3]),
+        ("completed", "desc", [3, 1, 2]),
+    ],
+)
+def test_get_tasks_supports_validated_sorting(
+    client, sort_by, sort_order, expected_ids
+):
+    """Allowed sort fields and directions should order results in SQL."""
+    # Add one completed task with a title that sorts after both seeds.
+    client.post("/tasks", json={"title": "Zebra task", "completed": True})
+
+    response = client.get(
+        "/tasks",
+        params={"sort_by": sort_by, "sort_order": sort_order},
+    )
+
+    assert response.status_code == 200
+    assert [task["id"] for task in response.json()] == expected_ids
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"sort_by": "created_at"},
+        {"sort_by": "id; DROP TABLE tasks"},
+        {"sort_order": "sideways"},
+    ],
+    ids=["unsupported-field", "sql-injection", "invalid-direction"],
+)
+def test_get_tasks_rejects_invalid_sort_parameters(client, params):
+    """Only whitelisted sort fields and directions should be accepted."""
+    response = client.get("/tasks", params=params)
+
+    assert response.status_code == 422
+    field = next(iter(params))
+    assert any(
+        error["loc"] == ["query", field]
+        for error in response.json()["detail"]
+    )
+
+
 def test_create_task_returns_201(client):
     """Posting a valid task should create it with a server-assigned ID."""
     response = client.post(

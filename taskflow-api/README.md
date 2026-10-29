@@ -94,7 +94,7 @@ cleanup, and lets tests replace the real database session with an isolated one.
 | Method | Path | Purpose | Success status |
 | --- | --- | --- | --- |
 | `GET` | `/health` | Check that the API is running and healthy. | `200` |
-| `GET` | `/tasks` | List every task from SQLite, ordered by ID. | `200` |
+| `GET` | `/tasks` | List tasks from SQLite. Supports optional `completed`, `sort_by`, and `sort_order` query parameters; defaults to all tasks ordered by ID. | `200` |
 | `POST` | `/tasks` | Create a task from a `title` and optional `completed` value. The database assigns the ID. | `201` |
 | `GET` | `/tasks/{task_id}` | Retrieve one task by ID. | `200` |
 | `PATCH` | `/tasks/{task_id}` | Partially update `title` and/or `completed`. Omitted fields are left unchanged. | `200` |
@@ -111,6 +111,41 @@ Requests for a task ID that does not exist return `404` with
   not be explicitly set to JSON `null`. `{"title": null}` and
   `{"completed": null}` are rejected with `422`, so a partial update cannot
   erase required task data.
+
+### Filtering and sorting tasks
+
+`GET /tasks` accepts three optional query parameters. Invalid values are
+rejected with `422 Unprocessable Entity` before the endpoint runs.
+
+| Parameter | Allowed values | Default | Behavior |
+| --- | --- | --- | --- |
+| `completed` | `true` or `false` | omitted | When omitted, every task is returned (the original behavior). When set, only tasks whose `completed` value matches are returned. |
+| `sort_by` | `id`, `title`, `completed` | `id` | Selects the column used for ordering. Only these fixed column names are accepted. |
+| `sort_order` | `asc`, `desc` | `asc` | Selects ascending or descending order. Ties are broken by ascending ID. |
+
+Filtering and sorting are performed by SQLAlchemy in the SQL query, not in
+Python. A filter that matches no tasks returns `200` with an empty JSON array
+(`[]`), not `404`.
+
+```bash
+# Only completed tasks (default order: ID ascending)
+curl "http://127.0.0.1:8000/tasks?completed=true"
+
+# Only incomplete tasks
+curl "http://127.0.0.1:8000/tasks?completed=false"
+
+# All tasks, newest first
+curl "http://127.0.0.1:8000/tasks?sort_by=id&sort_order=desc"
+
+# Incomplete tasks, sorted by title A-Z
+curl "http://127.0.0.1:8000/tasks?completed=false&sort_by=title&sort_order=asc"
+
+# Invalid: returns 422 instead of sorting by an arbitrary column
+curl "http://127.0.0.1:8000/tasks?sort_by=created_at"
+```
+
+Omitting all three parameters produces exactly the same response as before
+this feature was added: every task, ordered by ascending ID.
 
 ### Example requests
 
@@ -159,7 +194,7 @@ python -m pytest -v
 On macOS or Linux, activate the environment with
 `source .venv/bin/activate` instead.
 
-The suite currently contains 13 tests. Each test creates a fresh SQLite file
+The suite currently contains 29 tests. Each test creates a fresh SQLite file
 under pytest's `tmp_path`, creates the schema from the ORM metadata, seeds two
 known tasks, and installs a `get_db` dependency override. The temporary database
 is discarded afterward, so tests never delete or modify the real
@@ -167,8 +202,10 @@ is discarded afterward, so tests never delete or modify the real
 
 The tests cover the health check, task listing and retrieval, creation and
 validation, partial updates, rejection of explicit `null` values, unique ID
-generation after deletion (including deletion of the highest ID), and deletion
-behavior.
+generation after deletion (including deletion of the highest ID), deletion
+behavior, filtering by both boolean values, empty filter results, invalid
+boolean query values, and whitelisted sorting fields and directions (including
+rejection of unsupported or injection-style values).
 
 ## Running the API locally
 
@@ -189,8 +226,8 @@ On startup, missing tables are created in `taskflow.db`. Then open
   changing an existing schema requires a separate migration.
 - **SQLite only.** The project is intended for local learning and small
   workloads, not for high-concurrency or multi-server deployment.
-- **No pagination, filtering, sorting, or search.** `GET /tasks` always returns
-  the full table.
+- **No pagination or search.** `GET /tasks` supports filtering and sorting but
+  always returns every matching task, without limit/offset or text search.
 - **Single-resource updates only.** There is no bulk create/update/delete.
 - **Minimal error handling.** Besides FastAPI's validation responses and the
   `404` for unknown tasks, there is no custom error envelope or logging.
