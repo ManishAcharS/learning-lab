@@ -1,9 +1,12 @@
+import logging
 from contextlib import asynccontextmanager
 from typing import Annotated, Literal
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from database import get_db, init_db
@@ -22,6 +25,35 @@ app = FastAPI(title="Taskflow API", lifespan=lifespan)
 
 DbSession = Annotated[Session, Depends(get_db)]
 
+logger = logging.getLogger(__name__)
+DATABASE_ERROR_DETAIL = "Database operation failed"
+
+
+@app.exception_handler(SQLAlchemyError)
+async def handle_database_error(request: Request, exc: SQLAlchemyError):
+    """Log database failures and return a generic response, never internals."""
+    logger.error(
+        "Unhandled database error",
+        exc_info=(type(exc), exc, exc.__traceback__),
+    )
+    return JSONResponse(
+        status_code=500,
+        content={"detail": DATABASE_ERROR_DETAIL},
+    )
+
+
+def commit_changes(db: Session) -> None:
+    """Commit pending changes, rolling back and hiding internals on failure."""
+    try:
+        db.commit()
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception("Database commit failed")
+        raise HTTPException(
+            status_code=500,
+            detail=DATABASE_ERROR_DETAIL,
+        ) from None
+
 
 @app.get("/health")
 def health():
@@ -35,16 +67,32 @@ class TaskCreate(BaseModel):
     title: str = Field(min_length=1, max_length=100)
     completed: bool = False
 
+    @field_validator("title")
+    @classmethod
+    def reject_blank_title(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("title must not be empty or whitespace-only")
+        return value
+
 
 class TaskUpdate(BaseModel):
     title: str | None = Field(default=None, min_length=1, max_length=100)
     completed: bool | None = None
 
-    @field_validator("title", "completed")
+    @field_validator("title")
     @classmethod
-    def reject_explicit_null(cls, value):
+    def validate_title(cls, value):
         # Omitted fields never reach this validator, so partial updates still
         # leave them unchanged. An explicit JSON null, however, is rejected.
+        if value is None:
+            raise ValueError("must not be null; omit the field to leave it unchanged")
+        if not value.strip():
+            raise ValueError("title must not be empty or whitespace-only")
+        return value
+
+    @field_validator("completed")
+    @classmethod
+    def reject_explicit_null(cls, value):
         if value is None:
             raise ValueError("must not be null; omit the field to leave it unchanged")
         return value
@@ -101,7 +149,7 @@ def get_tasks(
 def create_task(task: TaskCreate, db: DbSession):
     new_task = Task(title=task.title, completed=task.completed)
     db.add(new_task)
-    db.commit()
+    commit_changes(db)
     db.refresh(new_task)
     return new_task
 
@@ -127,7 +175,7 @@ def update_task(task_id: int, update: TaskUpdate, db: DbSession):
         for field, value in changes.items():
             setattr(task, field, value)
 
-        db.commit()
+        commit_changes(db)
         db.refresh(task)
         return task
 
@@ -139,7 +187,7 @@ def delete_task(task_id: int, db: DbSession):
     task = db.get(Task, task_id)
     if task is not None:
         db.delete(task)
-        db.commit()
+        commit_changes(db)
         return
 
     raise HTTPException(status_code=404, detail="Task not found")

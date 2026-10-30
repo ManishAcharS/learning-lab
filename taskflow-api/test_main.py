@@ -3,7 +3,8 @@
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session, sessionmaker
 
 import main
 from database import Base, get_db
@@ -50,6 +51,10 @@ def client(tmp_path):
         session = TestingSessionLocal()
         try:
             yield session
+        except Exception:
+            # Mirror production get_db: roll back, then let the error propagate.
+            session.rollback()
+            raise
         finally:
             session.close()
 
@@ -216,6 +221,48 @@ def test_create_task_rejects_invalid_title(client, payload):
     assert len(client.get("/tasks").json()) == len(SEED_TASKS)
 
 
+def test_create_task_rejects_whitespace_only_title(client):
+    """A title containing only whitespace must not create a record."""
+    response = client.post("/tasks", json={"title": " \t\n "})
+
+    assert response.status_code == 422
+    assert any(
+        error["loc"] == ["body", "title"]
+        for error in response.json()["detail"]
+    )
+    assert client.get("/tasks").json() == SEED_TASKS
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"title": 123},
+        {"title": ["not", "a", "string"]},
+        {"title": "Valid title", "completed": "definitely-not-a-boolean"},
+        {"title": "Valid title", "completed": {"unexpected": True}},
+    ],
+    ids=["numeric-title", "list-title", "invalid-completed-string", "object-completed"],
+)
+def test_create_task_rejects_invalid_field_types(client, payload):
+    """Fields with the wrong JSON types should fail without inserting rows."""
+    response = client.post("/tasks", json=payload)
+
+    assert response.status_code == 422
+    assert client.get("/tasks").json() == SEED_TASKS
+
+
+def test_create_task_rejects_excessively_long_title(client):
+    """A title over the 100-character limit should be rejected atomically."""
+    response = client.post("/tasks", json={"title": "x" * 101})
+
+    assert response.status_code == 422
+    assert any(
+        error["loc"] == ["body", "title"]
+        for error in response.json()["detail"]
+    )
+    assert client.get("/tasks").json() == SEED_TASKS
+
+
 def test_get_task_returns_existing_task(client):
     """Fetching a seeded task ID should return that task."""
     response = client.get("/tasks/2")
@@ -227,6 +274,31 @@ def test_get_task_returns_existing_task(client):
 def test_get_task_returns_404_for_unknown_id(client):
     """Fetching an ID that does not exist should return 404."""
     response = client.get("/tasks/999")
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Task not found"}
+
+
+@pytest.mark.parametrize(
+    "task_id",
+    ["abc", "1.5", "1e2"],
+    ids=["text", "float", "scientific-notation"],
+)
+def test_get_task_rejects_invalid_path_parameter(client, task_id):
+    """Non-integer path values should fail path validation with 422."""
+    response = client.get(f"/tasks/{task_id}")
+
+    assert response.status_code == 422
+    assert any(
+        error["loc"] == ["path", "task_id"]
+        for error in response.json()["detail"]
+    )
+
+
+@pytest.mark.parametrize("task_id", [0, -1], ids=["zero", "negative"])
+def test_get_task_returns_404_for_unassigned_ids(client, task_id):
+    """Zero and negative integers are valid ints but never assigned IDs."""
+    response = client.get(f"/tasks/{task_id}")
 
     assert response.status_code == 404
     assert response.json() == {"detail": "Task not found"}
@@ -278,6 +350,56 @@ def test_patch_task_rejects_explicit_null(client, field):
     assert client.get("/tasks").json() == SEED_TASKS
 
 
+def test_patch_task_returns_404_for_unknown_id(client):
+    """Patching a missing task should fail without touching existing rows."""
+    before = client.get("/tasks").json()
+
+    response = client.patch("/tasks/999", json={"completed": True})
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Task not found"}
+    assert client.get("/tasks").json() == before
+
+
+def test_patch_task_with_empty_body_is_a_noop(client):
+    """An empty partial update is valid and leaves the task unchanged."""
+    before = client.get("/tasks/1").json()
+
+    response = client.patch("/tasks/1", json={})
+
+    assert response.status_code == 200
+    assert response.json() == before
+    assert client.get("/tasks/1").json() == before
+    assert client.get("/tasks").json() == SEED_TASKS
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"title": ""},
+        {"title": "   "},
+        {"title": "x" * 101},
+        {"title": 123},
+        {"completed": "definitely-not-a-boolean"},
+    ],
+    ids=["empty-title", "blank-title", "long-title", "numeric-title", "bad-completed"],
+)
+def test_patch_task_rejects_invalid_values_without_changing_data(client, payload):
+    """Invalid patch values should return 422 and leave the row untouched."""
+    before = client.get("/tasks/1").json()
+    field = next(iter(payload))
+
+    response = client.patch("/tasks/1", json=payload)
+
+    assert response.status_code == 422
+    assert any(
+        error["loc"] == ["body", field]
+        for error in response.json()["detail"]
+    )
+    assert client.get("/tasks/1").json() == before
+    assert client.get("/tasks").json() == SEED_TASKS
+
+
 def test_create_task_uses_unique_id_after_deletion(client):
     """Deleting a task must not cause the next created task to reuse an ID."""
     assert client.delete("/tasks/1").status_code == 204
@@ -315,3 +437,122 @@ def test_delete_task_returns_204_then_404(client):
 
     assert response.status_code == 404
     assert response.json() == {"detail": "Task not found"}
+
+
+def test_delete_unknown_task_returns_404_without_changes(client):
+    """Deleting an ID that was never assigned should not alter other tasks."""
+    before = client.get("/tasks").json()
+
+    response = client.delete("/tasks/999")
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Task not found"}
+    assert client.get("/tasks").json() == before
+
+
+def test_duplicate_post_creates_two_separate_tasks(client):
+    """POST is not idempotent: repeating a request creates another task."""
+    payload = {"title": "Duplicate request", "completed": False}
+
+    first = client.post("/tasks", json=payload)
+    second = client.post("/tasks", json=payload)
+
+    assert first.status_code == 201
+    assert second.status_code == 201
+    assert first.json()["id"] != second.json()["id"]
+    assert first.json()["title"] == second.json()["title"] == payload["title"]
+
+    listed = client.get("/tasks").json()
+    assert len(listed) == len(SEED_TASKS) + 2
+    assert [task["id"] for task in listed].count(first.json()["id"]) == 1
+    assert [task["id"] for task in listed].count(second.json()["id"]) == 1
+
+
+def _track_rollbacks(monkeypatch):
+    """Record Session.rollback calls while preserving the real behavior."""
+    original_rollback = Session.rollback
+    rollbacks = []
+
+    def tracking_rollback(session):
+        rollbacks.append(session)
+        return original_rollback(session)
+
+    monkeypatch.setattr(Session, "rollback", tracking_rollback)
+    return rollbacks
+
+
+def _force_commit_failure(monkeypatch):
+    """Make the next commits fail and expose the rollback call log."""
+    rollbacks = _track_rollbacks(monkeypatch)
+    message = "simulated database failure"
+
+    def failing_commit(session):
+        raise SQLAlchemyError(message)
+
+    monkeypatch.setattr(Session, "commit", failing_commit)
+    return rollbacks, message
+
+
+def test_create_commit_failure_returns_generic_500_and_rolls_back(
+    client, monkeypatch
+):
+    """A failed insert commit must roll back and never report success."""
+    rollbacks, message = _force_commit_failure(monkeypatch)
+
+    response = client.post("/tasks", json={"title": "Must not persist"})
+
+    assert response.status_code == 500
+    assert response.json() == {"detail": "Database operation failed"}
+    assert message not in response.text
+    assert rollbacks
+    assert client.get("/tasks").json() == SEED_TASKS
+
+
+def test_patch_commit_failure_returns_generic_500_and_rolls_back(
+    client, monkeypatch
+):
+    """A failed update commit must leave the original row unchanged."""
+    before = client.get("/tasks/1").json()
+    rollbacks, message = _force_commit_failure(monkeypatch)
+
+    response = client.patch("/tasks/1", json={"title": "Must not persist"})
+
+    assert response.status_code == 500
+    assert response.json() == {"detail": "Database operation failed"}
+    assert message not in response.text
+    assert rollbacks
+    assert client.get("/tasks/1").json() == before
+
+
+def test_delete_commit_failure_returns_generic_500_and_rolls_back(
+    client, monkeypatch
+):
+    """A failed delete commit must leave the task retrievable."""
+    before = client.get("/tasks/2").json()
+    rollbacks, message = _force_commit_failure(monkeypatch)
+
+    response = client.delete("/tasks/2")
+
+    assert response.status_code == 500
+    assert response.json() == {"detail": "Database operation failed"}
+    assert message not in response.text
+    assert rollbacks
+    assert client.get("/tasks/2").json() == before
+
+
+def test_read_failure_returns_generic_500_without_internals(client, monkeypatch):
+    """An unexpected read error must be logged, rolled back, and hidden."""
+    rollbacks = _track_rollbacks(monkeypatch)
+    message = "simulated read failure"
+
+    def failing_get(session, *args, **kwargs):
+        raise SQLAlchemyError(message)
+
+    monkeypatch.setattr(Session, "get", failing_get)
+
+    response = client.get("/tasks/1")
+
+    assert response.status_code == 500
+    assert response.json() == {"detail": "Database operation failed"}
+    assert message not in response.text
+    assert rollbacks

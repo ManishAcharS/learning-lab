@@ -30,10 +30,14 @@ SessionLocal = sessionmaker(
 
 
 def get_db() -> Generator[Session, None, None]:
-    """Yield one session per request and always close it afterward."""
+    """Yield one request-scoped session and always clean it up afterward."""
     db = SessionLocal()
     try:
         yield db
+    except Exception:
+        # Roll back any pending work, then re-raise so the error is not hidden.
+        db.rollback()
+        raise
     finally:
         db.close()
 
