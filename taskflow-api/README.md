@@ -254,7 +254,10 @@ taskflow-api/
 |-- models.py            # Task SQLAlchemy ORM model
 |-- test_main.py         # API tests with isolated temporary databases
 |-- database_practice.py # Standalone sqlite3 practice script (unchanged)
-|-- taskflow.db          # Development SQLite database
+|-- requirements.txt     # Pinned runtime dependencies
+|-- requirements-dev.txt # Runtime plus test dependencies
+|-- .gitignore           # Local databases, caches, and secret files
+|-- taskflow.db          # Local development database (not tracked)
 `-- README.md
 ```
 
@@ -266,9 +269,13 @@ install the dependencies, and run pytest:
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install fastapi uvicorn pytest httpx "SQLAlchemy>=2.0"
+python -m pip install -r requirements-dev.txt
 python -m pytest -v
 ```
+
+`requirements.txt` pins the runtime dependencies; `requirements-dev.txt`
+includes them and adds the test dependencies. The project requires Python 3.10
+or newer.
 
 On macOS or Linux, activate the environment with
 `source .venv/bin/activate` instead.
