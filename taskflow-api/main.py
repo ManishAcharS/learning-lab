@@ -1,5 +1,6 @@
 import logging
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Annotated, Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -99,13 +100,14 @@ class TaskUpdate(BaseModel):
 
 
 class TaskRead(BaseModel):
-    """Response shape for a task; created_at stays internal to the database."""
+    """Response shape for a task, including its database-generated timestamp."""
 
     model_config = ConfigDict(from_attributes=True)
 
     id: int
     title: str
     completed: bool
+    created_at: datetime
 
 
 SortField = Literal["id", "title", "completed"]

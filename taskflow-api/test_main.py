@@ -1,9 +1,11 @@
 """Tests for the TaskFlow FastAPI application."""
 
+from datetime import datetime, timedelta, timezone
+
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy import create_engine, select, text
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
 import main
@@ -15,14 +17,22 @@ SEED_TASKS = [
     {"id": 2, "title": "Build my first API", "completed": False},
 ]
 
+# Fields the client controls through the API. Server-generated fields such as
+# created_at are deliberately excluded so the seeded fixtures stay stable.
+CLIENT_FIELDS = ("id", "title", "completed")
+
+
+def without_server_fields(task):
+    """Drop database-generated fields before comparing with SEED_TASKS."""
+    return {field: task[field] for field in CLIENT_FIELDS}
+
 
 @pytest.fixture
-def client(tmp_path):
-    """Run each test against its own temporary SQLite database.
+def session_factory(tmp_path):
+    """Create an isolated temporary SQLite database with the real schema.
 
-    The production ``taskflow.db`` is never opened. A dependency override
-    points the API at a fresh database file under pytest's ``tmp_path``, and
-    the file is discarded when the test finishes.
+    The production ``taskflow.db`` is never opened. Each test gets a fresh
+    database file under pytest's ``tmp_path``, which is discarded afterward.
     """
     test_database = tmp_path / "test_taskflow.db"
     test_engine = create_engine(
@@ -36,7 +46,16 @@ def client(tmp_path):
     )
     Base.metadata.create_all(bind=test_engine)
 
-    with TestingSessionLocal() as session:
+    try:
+        yield TestingSessionLocal
+    finally:
+        test_engine.dispose()
+
+
+@pytest.fixture
+def client(session_factory):
+    """Run each API test against its own temporary SQLite database."""
+    with session_factory() as session:
         session.add_all(
             Task(
                 id=task["id"],
@@ -48,7 +67,7 @@ def client(tmp_path):
         session.commit()
 
     def override_get_db():
-        session = TestingSessionLocal()
+        session = session_factory()
         try:
             yield session
         except Exception:
@@ -68,7 +87,6 @@ def client(tmp_path):
     finally:
         test_client.close()
         main.app.dependency_overrides.pop(get_db, None)
-        test_engine.dispose()
 
 
 def test_health_returns_200(client):
@@ -87,7 +105,9 @@ def test_get_tasks_returns_expected_tasks(client):
     response = client.get("/tasks")
 
     assert response.status_code == 200
-    assert response.json() == SEED_TASKS
+    assert [
+        without_server_fields(task) for task in response.json()
+    ] == SEED_TASKS
 
 
 def test_get_tasks_without_filter_returns_all_tasks(client):
@@ -95,7 +115,9 @@ def test_get_tasks_without_filter_returns_all_tasks(client):
     response = client.get("/tasks")
 
     assert response.status_code == 200
-    assert response.json() == SEED_TASKS
+    assert [
+        without_server_fields(task) for task in response.json()
+    ] == SEED_TASKS
 
 
 def test_get_tasks_filters_by_completed_true(client):
@@ -116,7 +138,9 @@ def test_get_tasks_filters_by_completed_false(client):
     response = client.get("/tasks", params={"completed": "false"})
 
     assert response.status_code == 200
-    assert response.json() == SEED_TASKS
+    assert [
+        without_server_fields(task) for task in response.json()
+    ] == SEED_TASKS
 
 
 def test_get_tasks_filter_returns_empty_list_when_no_task_matches(client):
@@ -200,12 +224,105 @@ def test_create_task_returns_201(client):
 
     assert response.status_code == 201
     created = response.json()
-    assert created == {"id": 3, "title": "Write tests", "completed": True}
+    assert without_server_fields(created) == {
+        "id": 3,
+        "title": "Write tests",
+        "completed": True,
+    }
+    assert "created_at" in created
 
     # The new task must also be visible when listing tasks.
     listed_tasks = client.get("/tasks").json()
     assert len(listed_tasks) == len(SEED_TASKS) + 1
     assert listed_tasks[-1] == created
+
+
+def test_create_task_assigns_database_generated_created_at(
+    client, session_factory
+):
+    """A newly created task must receive a current database timestamp."""
+    before = datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0)
+    response = client.post("/tasks", json={"title": "Timestamped task"})
+    after = datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0)
+    after += timedelta(seconds=1)
+
+    assert response.status_code == 201
+    created = response.json()
+    created_at = datetime.fromisoformat(created["created_at"])
+    assert before <= created_at <= after
+
+    # The response and the stored row must expose the same timestamp.
+    with session_factory() as session:
+        stored = session.get(Task, created["id"])
+        assert stored is not None
+        assert stored.created_at == created_at
+
+
+def test_task_responses_include_created_at(client):
+    """Single-task and list responses must both expose a valid timestamp."""
+    responses = [
+        client.get("/tasks/1").json(),
+        *client.get("/tasks").json(),
+    ]
+
+    for task in responses:
+        assert "created_at" in task
+        assert isinstance(task["created_at"], str)
+        assert isinstance(datetime.fromisoformat(task["created_at"]), datetime)
+
+
+def test_create_task_defaults_completed_to_false(client, session_factory):
+    """Omitting completed must store false, not null or true."""
+    response = client.post("/tasks", json={"title": "No completed field"})
+
+    assert response.status_code == 201
+    created = response.json()
+    assert created["completed"] is False
+
+    with session_factory() as session:
+        stored = session.get(Task, created["id"])
+        assert stored is not None
+        assert stored.completed is False
+
+
+def test_create_task_accepts_title_at_max_length(client):
+    """Exactly 100 characters is valid; the limit must not be off by one."""
+    title = "x" * 100
+
+    response = client.post("/tasks", json={"title": title})
+
+    assert response.status_code == 201
+    assert response.json()["title"] == title
+
+
+def test_client_cannot_set_server_generated_fields_on_create(client):
+    """id and created_at supplied by a client must be ignored."""
+    response = client.post(
+        "/tasks",
+        json={
+            "id": 999,
+            "title": "Server owns generated fields",
+            "created_at": "2000-01-01T00:00:00",
+        },
+    )
+
+    assert response.status_code == 201
+    created = response.json()
+    assert created["id"] == 3
+    assert datetime.fromisoformat(created["created_at"]) > datetime(2000, 1, 1)
+
+
+def test_client_cannot_set_server_generated_fields_on_update(client):
+    """PATCH must not let a client change id or created_at."""
+    before = client.get("/tasks/1").json()
+
+    response = client.patch(
+        "/tasks/1",
+        json={"id": 99, "created_at": "2000-01-01T00:00:00"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == before
 
 
 @pytest.mark.parametrize(
@@ -230,7 +347,9 @@ def test_create_task_rejects_whitespace_only_title(client):
         error["loc"] == ["body", "title"]
         for error in response.json()["detail"]
     )
-    assert client.get("/tasks").json() == SEED_TASKS
+    assert [
+        without_server_fields(task) for task in client.get("/tasks").json()
+    ] == SEED_TASKS
 
 
 @pytest.mark.parametrize(
@@ -248,7 +367,9 @@ def test_create_task_rejects_invalid_field_types(client, payload):
     response = client.post("/tasks", json=payload)
 
     assert response.status_code == 422
-    assert client.get("/tasks").json() == SEED_TASKS
+    assert [
+        without_server_fields(task) for task in client.get("/tasks").json()
+    ] == SEED_TASKS
 
 
 def test_create_task_rejects_excessively_long_title(client):
@@ -260,7 +381,9 @@ def test_create_task_rejects_excessively_long_title(client):
         error["loc"] == ["body", "title"]
         for error in response.json()["detail"]
     )
-    assert client.get("/tasks").json() == SEED_TASKS
+    assert [
+        without_server_fields(task) for task in client.get("/tasks").json()
+    ] == SEED_TASKS
 
 
 def test_get_task_returns_existing_task(client):
@@ -268,7 +391,7 @@ def test_get_task_returns_existing_task(client):
     response = client.get("/tasks/2")
 
     assert response.status_code == 200
-    assert response.json() == SEED_TASKS[1]
+    assert without_server_fields(response.json()) == SEED_TASKS[1]
 
 
 def test_get_task_returns_404_for_unknown_id(client):
@@ -310,7 +433,7 @@ def test_patch_task_updates_only_supplied_fields(client):
     response = client.patch("/tasks/1", json={"completed": True})
 
     assert response.status_code == 200
-    assert response.json() == {
+    assert without_server_fields(response.json()) == {
         "id": 1,
         "title": "Learn FastAPI",
         "completed": True,
@@ -320,19 +443,19 @@ def test_patch_task_updates_only_supplied_fields(client):
     response = client.patch("/tasks/1", json={"title": "Learn FastAPI in depth"})
 
     assert response.status_code == 200
-    assert response.json() == {
+    assert without_server_fields(response.json()) == {
         "id": 1,
         "title": "Learn FastAPI in depth",
         "completed": True,
     }
 
     # Changes are persisted, and unrelated tasks are untouched.
-    assert client.get("/tasks/1").json() == {
+    assert without_server_fields(client.get("/tasks/1").json()) == {
         "id": 1,
         "title": "Learn FastAPI in depth",
         "completed": True,
     }
-    assert client.get("/tasks/2").json() == SEED_TASKS[1]
+    assert without_server_fields(client.get("/tasks/2").json()) == SEED_TASKS[1]
 
 
 @pytest.mark.parametrize("field", ["title", "completed"])
@@ -347,7 +470,9 @@ def test_patch_task_rejects_explicit_null(client, field):
     assert any(error["loc"] == ["body", field] for error in errors)
     # The rejected request must not change the task or any other task.
     assert client.get("/tasks/1").json() == before
-    assert client.get("/tasks").json() == SEED_TASKS
+    assert [
+        without_server_fields(task) for task in client.get("/tasks").json()
+    ] == SEED_TASKS
 
 
 def test_patch_task_returns_404_for_unknown_id(client):
@@ -370,7 +495,9 @@ def test_patch_task_with_empty_body_is_a_noop(client):
     assert response.status_code == 200
     assert response.json() == before
     assert client.get("/tasks/1").json() == before
-    assert client.get("/tasks").json() == SEED_TASKS
+    assert [
+        without_server_fields(task) for task in client.get("/tasks").json()
+    ] == SEED_TASKS
 
 
 @pytest.mark.parametrize(
@@ -397,7 +524,9 @@ def test_patch_task_rejects_invalid_values_without_changing_data(client, payload
         for error in response.json()["detail"]
     )
     assert client.get("/tasks/1").json() == before
-    assert client.get("/tasks").json() == SEED_TASKS
+    assert [
+        without_server_fields(task) for task in client.get("/tasks").json()
+    ] == SEED_TASKS
 
 
 def test_create_task_uses_unique_id_after_deletion(client):
@@ -468,6 +597,38 @@ def test_duplicate_post_creates_two_separate_tasks(client):
     assert [task["id"] for task in listed].count(second.json()["id"]) == 1
 
 
+@pytest.mark.parametrize(
+    "title",
+    ["", "x" * 101],
+    ids=["empty", "too-long"],
+)
+def test_database_rejects_invalid_title(session_factory, title):
+    """The SQLite CHECK constraint must reject invalid data without the API."""
+    with session_factory() as session:
+        session.add(Task(title=title))
+        with pytest.raises(IntegrityError):
+            session.commit()
+        session.rollback()
+
+    with session_factory() as session:
+        assert session.get(Task, 1) is None
+
+
+def test_database_generates_defaults_for_completed_and_created_at(
+    session_factory,
+):
+    """Raw inserts must receive the database defaults, not only ORM defaults."""
+    with session_factory() as session:
+        session.execute(
+            text("INSERT INTO tasks (title) VALUES ('Database defaults')")
+        )
+        session.commit()
+
+        task = session.scalars(select(Task)).one()
+        assert task.completed is False
+        assert isinstance(task.created_at, datetime)
+
+
 def _track_rollbacks(monkeypatch):
     """Record Session.rollback calls while preserving the real behavior."""
     original_rollback = Session.rollback
@@ -505,7 +666,9 @@ def test_create_commit_failure_returns_generic_500_and_rolls_back(
     assert response.json() == {"detail": "Database operation failed"}
     assert message not in response.text
     assert rollbacks
-    assert client.get("/tasks").json() == SEED_TASKS
+    assert [
+        without_server_fields(task) for task in client.get("/tasks").json()
+    ] == SEED_TASKS
 
 
 def test_patch_commit_failure_returns_generic_500_and_rolls_back(
