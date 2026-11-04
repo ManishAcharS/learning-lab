@@ -15,6 +15,7 @@ from models import Task
 SEED_TASKS = [
     {"id": 1, "title": "Learn FastAPI", "completed": False},
     {"id": 2, "title": "Build my first API", "completed": False},
+    {"id": 3, "title": "i want to become rich", "completed": False},
 ]
 
 # Fields the client controls through the API. Server-generated fields such as
