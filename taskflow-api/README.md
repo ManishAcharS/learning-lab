@@ -1,9 +1,9 @@
 # TaskFlow API
 
 A small task-management REST API built with FastAPI, Pydantic 2, the
-SQLAlchemy 2.x ORM, and SQLite. It supports listing, creating, retrieving,
-partially updating, and deleting tasks. Tasks are persisted in
-`taskflow.db`, so they survive an application restart.
+SQLAlchemy 2.x ORM, and SQLite. It supports paginated, searchable, filtered
+listing, plus creating, retrieving, partially updating, and deleting tasks.
+Tasks are persisted in `taskflow.db`, so they survive an application restart.
 
 ## Request lifecycle
 
@@ -108,7 +108,7 @@ cleanup, and lets tests replace the real database session with an isolated one.
 | Method | Path | Purpose | Success status |
 | --- | --- | --- | --- |
 | `GET` | `/health` | Check that the API is running and healthy. | `200` |
-| `GET` | `/tasks` | List tasks from SQLite. Supports optional `completed`, `sort_by`, and `sort_order` query parameters; defaults to all tasks ordered by ID. | `200` |
+| `GET` | `/tasks` | List tasks from SQLite. Supports optional `completed`, `search`, `sort_by`, `sort_order`, `limit`, and `offset` query parameters; defaults to the first 20 tasks ordered by ID. | `200` |
 | `POST` | `/tasks` | Create a task from a `title` and optional `completed` value. The database assigns the ID. | `201` |
 | `GET` | `/tasks/{task_id}` | Retrieve one task by ID. | `200` |
 | `PATCH` | `/tasks/{task_id}` | Partially update `title` and/or `completed`. Omitted fields are left unchanged. | `200` |
@@ -162,27 +162,42 @@ first request had already committed. Idempotent retries would require an
 additional client-supplied key, a uniqueness constraint, and stored results;
 that infrastructure is intentionally not part of this API yet.
 
-### Filtering and sorting tasks
+### Filtering, searching, sorting, and pagination
 
-`GET /tasks` accepts three optional query parameters. Invalid values are
-rejected with `422 Unprocessable Entity` before the endpoint runs.
+`GET /tasks` accepts optional query parameters. Invalid values are rejected
+with `422 Unprocessable Entity` before the endpoint runs.
 
 | Parameter | Allowed values | Default | Behavior |
 | --- | --- | --- | --- |
-| `completed` | `true` or `false` | omitted | When omitted, every task is returned (the original behavior). When set, only tasks whose `completed` value matches are returned. |
+| `completed` | `true` or `false` | omitted | When omitted, every task is considered. When set, only tasks whose `completed` value matches are returned. |
+| `search` | 1–100 characters | omitted | Case-insensitive substring match on `title`. `%` and `_` are treated as literal characters, not SQL wildcards. |
 | `sort_by` | `id`, `title`, `completed` | `id` | Selects the column used for ordering. Only these fixed column names are accepted. |
 | `sort_order` | `asc`, `desc` | `asc` | Selects ascending or descending order. Ties are broken by ascending ID. |
+| `limit` | integer 1–100 | `20` | Maximum number of tasks returned in this page. |
+| `offset` | integer 0 or greater | `0` | Number of matching tasks to skip before returning the page. |
 
-Filtering and sorting are performed by SQLAlchemy in the SQL query, not in
-Python. A filter that matches no tasks returns `200` with an empty JSON array
-(`[]`), not `404`.
+Filtering, searching, sorting, counting, and pagination are performed by
+SQLAlchemy in SQL, not by loading every row and slicing it in Python. The total
+is counted with the same filters as the page query. A filter that matches no
+tasks returns `200` with an empty JSON array (`[]`), not `404`.
+
+Every successful list response includes these headers:
+
+| Header | Meaning |
+| --- | --- |
+| `X-Total-Count` | Number of tasks matching the filters, before `limit`/`offset`. |
+| `X-Limit` | Effective page size (the requested value or the default). |
+| `X-Offset` | Effective offset (the requested value or the default). |
+
+The response body remains a plain JSON array of tasks; pagination metadata is
+only in the headers.
 
 ```bash
-# Only completed tasks (default order: ID ascending)
+# Only completed tasks (first 20 by ID)
 curl "http://127.0.0.1:8000/tasks?completed=true"
 
-# Only incomplete tasks
-curl "http://127.0.0.1:8000/tasks?completed=false"
+# Case-insensitive title search
+curl "http://127.0.0.1:8000/tasks?search=fastapi"
 
 # All tasks, newest first
 curl "http://127.0.0.1:8000/tasks?sort_by=id&sort_order=desc"
@@ -190,12 +205,16 @@ curl "http://127.0.0.1:8000/tasks?sort_by=id&sort_order=desc"
 # Incomplete tasks, sorted by title A-Z
 curl "http://127.0.0.1:8000/tasks?completed=false&sort_by=title&sort_order=asc"
 
+# Third page of 10, with total/limit/offset metadata in response headers
+curl "http://127.0.0.1:8000/tasks?limit=10&offset=20"
+
 # Invalid: returns 422 instead of sorting by an arbitrary column
 curl "http://127.0.0.1:8000/tasks?sort_by=created_at"
 ```
 
-Omitting all three parameters produces exactly the same response as before
-this feature was added: every task, ordered by ascending ID.
+Omitting all parameters returns the first 20 tasks ordered by ascending ID.
+An offset past the last matching row returns `200`, an empty array, and headers
+whose `X-Total-Count` still reports the full filtered total.
 
 ### Example requests
 
@@ -284,26 +303,33 @@ or newer.
 On macOS or Linux, activate the environment with
 `source .venv/bin/activate` instead.
 
-The suite currently contains 62 tests. Each test creates a fresh SQLite file
-under pytest's `tmp_path`, creates the schema from the ORM metadata, seeds two
-known tasks, and installs a `get_db` dependency override. The temporary database
-is discarded afterward, so tests never delete or modify the real
-`taskflow.db`, and one test cannot leak state into another. The test override
-also rolls back on exceptions, matching the production dependency.
+The suite currently contains 87 tests. Each test creates a fresh SQLite file
+under pytest's `tmp_path`, creates the schema from the ORM metadata, seeds three
+known tasks, and installs a `get_db` dependency override. The test-client
+helper always removes that override, and each request-scoped session is closed
+in a `finally` block. The temporary database is discarded afterward, so tests
+never delete or modify the real `taskflow.db`, and one test cannot leak state
+into another. The test override also rolls back on exceptions, matching the
+production dependency.
+Focused isolation tests verify the temporary database path, override cleanup,
+and that the real development database file is unchanged.
 
 The tests cover the health check, task listing and retrieval, creation and
 validation (including missing, empty, whitespace-only, wrong-typed, and
 over-length titles), invalid path parameters, partial updates, empty PATCH
 bodies, rejection of explicit `null` values, invalid PATCH values, duplicate
 POST requests, unique ID generation after deletion (including deletion of the
-highest ID), deletion behavior, filtering by both boolean values, empty filter
-results, invalid boolean query values, and whitelisted sorting fields and
-directions (including rejection of unsupported or injection-style values),
-database-generated timestamps and `completed` defaults, rejection of
-client-supplied `id`/`created_at`, and direct database inserts that violate the
-title `CHECK` constraint. Database commit and read failures are simulated with
-monkeypatched sessions to verify rollback, generic `500` responses, and the
-absence of leaked internals.
+highest ID), deletion behavior, filtering by both boolean values,
+case-insensitive title search, combined search and completion filters, empty
+filter results, invalid boolean/search query values, whitelisted sorting fields
+and directions (including rejection of unsupported or injection-style values),
+stable ID tie-breaking, database-generated timestamps and `completed` defaults,
+rejection of client-supplied `id`/`created_at`, and direct database inserts that
+violate the title `CHECK` constraint. Pagination tests cover defaults, custom
+limit/offset, page slicing, filtered totals, invalid bounds, out-of-range
+offsets, response headers, and public-field serialization. Database commit and
+read failures are simulated with monkeypatched sessions to verify rollback,
+generic `500` responses, and the absence of leaked internals.
 
 ## Running the API locally
 
@@ -324,8 +350,10 @@ On startup, missing tables are created in `taskflow.db`. Then open
   changing an existing schema requires a separate migration.
 - **SQLite only.** The project is intended for local learning and small
   workloads, not for high-concurrency or multi-server deployment.
-- **No pagination or search.** `GET /tasks` supports filtering and sorting but
-  always returns every matching task, without limit/offset or text search.
+- **Simple substring search.** `search` uses SQL `LIKE` on `title`; there is no
+  full-text index, tokenization, ranking, or multi-column search.
+- **Offset pagination only.** Large offsets still require SQLite to scan the
+  skipped rows. Cursor pagination would be needed for very large datasets.
 - **Single-resource updates only.** There is no bulk create/update/delete.
 - **POST is not idempotent.** Repeated or retried requests can create duplicate
   tasks. There are no idempotency keys or unique-title constraints.

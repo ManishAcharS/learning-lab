@@ -3,10 +3,10 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Annotated, Literal
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -113,6 +113,9 @@ class TaskRead(BaseModel):
 SortField = Literal["id", "title", "completed"]
 SortOrder = Literal["asc", "desc"]
 
+DEFAULT_PAGE_LIMIT = 20
+MAX_PAGE_LIMIT = 100
+
 # Explicit whitelist: clients choose a name, never a SQL expression.
 SORT_COLUMNS = {
     "id": Task.id,
@@ -121,18 +124,36 @@ SORT_COLUMNS = {
 }
 
 
+def escape_like_pattern(value: str) -> str:
+    """Treat LIKE wildcards in user input as literal characters."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 @app.get("/tasks", response_model=list[TaskRead])
 def get_tasks(
     db: DbSession,
+    response: Response,
     completed: bool | None = None,
+    search: Annotated[str | None, Query(min_length=1, max_length=100)] = None,
     sort_by: SortField = "id",
     sort_order: SortOrder = "asc",
+    limit: Annotated[int, Query(ge=1, le=MAX_PAGE_LIMIT)] = DEFAULT_PAGE_LIMIT,
+    offset: Annotated[int, Query(ge=0)] = 0,
 ):
-    statement = select(Task)
+    filters = []
 
     # Filter in SQL; False must still apply, so compare explicitly to None.
     if completed is not None:
-        statement = statement.where(Task.completed == completed)
+        filters.append(Task.completed == completed)
+
+    if search is not None:
+        pattern = f"%{escape_like_pattern(search)}%"
+        filters.append(Task.title.ilike(pattern, escape="\\"))
+
+    # Count using the same filters as the page query, before limit/offset.
+    total = db.scalar(select(func.count()).select_from(Task).where(*filters)) or 0
+
+    statement = select(Task).where(*filters)
 
     sort_column = SORT_COLUMNS[sort_by]
     if sort_order == "asc":
@@ -144,7 +165,15 @@ def get_tasks(
     if sort_by != "id":
         statement = statement.order_by(Task.id.asc())
 
-    return db.scalars(statement).all()
+    # Pagination belongs to the database query, never to Python slicing.
+    statement = statement.offset(offset).limit(limit)
+
+    tasks = db.scalars(statement).all()
+
+    response.headers["X-Total-Count"] = str(total)
+    response.headers["X-Limit"] = str(limit)
+    response.headers["X-Offset"] = str(offset)
+    return tasks
 
 
 @app.post("/tasks", response_model=TaskRead, status_code=201)

@@ -1,6 +1,8 @@
 """Tests for the TaskFlow FastAPI application."""
 
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -9,7 +11,7 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
 import main
-from database import Base, get_db
+from database import DATABASE_PATH, Base, get_db
 from models import Task
 
 SEED_TASKS = [
@@ -53,9 +55,9 @@ def session_factory(tmp_path):
         test_engine.dispose()
 
 
-@pytest.fixture
-def client(session_factory):
-    """Run each API test against its own temporary SQLite database."""
+@contextmanager
+def api_client(session_factory):
+    """Yield a TestClient backed by the fixture's temporary database."""
     with session_factory() as session:
         session.add_all(
             Task(
@@ -88,6 +90,13 @@ def client(session_factory):
     finally:
         test_client.close()
         main.app.dependency_overrides.pop(get_db, None)
+
+
+@pytest.fixture
+def client(session_factory):
+    """Run each API test against its own temporary SQLite database."""
+    with api_client(session_factory) as test_client:
+        yield test_client
 
 
 def test_health_returns_200(client):
@@ -171,19 +180,19 @@ def test_get_tasks_rejects_invalid_completed_filter(client, value):
 @pytest.mark.parametrize(
     ("sort_by", "sort_order", "expected_ids"),
     [
-        ("id", "asc", [1, 2, 3]),
-        ("id", "desc", [3, 2, 1]),
-        ("title", "asc", [2, 1, 3]),
-        ("title", "desc", [3, 1, 2]),
-        ("completed", "asc", [1, 2, 3]),
-        ("completed", "desc", [3, 1, 2]),
+        ("id", "asc", [1, 2, 3, 4]),
+        ("id", "desc", [4, 3, 2, 1]),
+        ("title", "asc", [2, 1, 4, 3]),
+        ("title", "desc", [3, 4, 1, 2]),
+        ("completed", "asc", [1, 2, 3, 4]),
+        ("completed", "desc", [4, 1, 2, 3]),
     ],
 )
 def test_get_tasks_supports_validated_sorting(
     client, sort_by, sort_order, expected_ids
 ):
     """Allowed sort fields and directions should order results in SQL."""
-    # Add one completed task with a title that sorts after both seeds.
+    # Add one completed task with a title that sorts after the seeded tasks.
     client.post("/tasks", json={"title": "Zebra task", "completed": True})
 
     response = client.get(
@@ -199,10 +208,20 @@ def test_get_tasks_supports_validated_sorting(
     "params",
     [
         {"sort_by": "created_at"},
+        {"sort_by": "priority"},
+        {"sort_by": "due_date"},
+        {"sort_by": "status"},
         {"sort_by": "id; DROP TABLE tasks"},
         {"sort_order": "sideways"},
     ],
-    ids=["unsupported-field", "sql-injection", "invalid-direction"],
+    ids=[
+        "unsupported-field",
+        "invented-priority",
+        "invented-due-date",
+        "invented-status",
+        "sql-injection",
+        "invalid-direction",
+    ],
 )
 def test_get_tasks_rejects_invalid_sort_parameters(client, params):
     """Only whitelisted sort fields and directions should be accepted."""
@@ -216,6 +235,268 @@ def test_get_tasks_rejects_invalid_sort_parameters(client, params):
     )
 
 
+def test_get_tasks_defaults_to_first_20_items(client, session_factory):
+    """Omitting pagination parameters should use limit=20 and offset=0."""
+    with session_factory() as session:
+        session.add_all(Task(title=f"Extra task {index}") for index in range(22))
+        session.commit()
+
+    response = client.get("/tasks")
+
+    assert response.status_code == 200
+    assert [task["id"] for task in response.json()] == list(range(1, 21))
+    assert response.headers["X-Total-Count"] == "25"
+    assert response.headers["X-Limit"] == "20"
+    assert response.headers["X-Offset"] == "0"
+
+
+def test_get_tasks_applies_custom_limit_and_offset(client):
+    """A custom page should slice the SQL result, not the full Python list."""
+    response = client.get("/tasks", params={"limit": 2, "offset": 1})
+
+    assert response.status_code == 200
+    assert [task["id"] for task in response.json()] == [2, 3]
+    assert response.headers["X-Total-Count"] == str(len(SEED_TASKS))
+    assert response.headers["X-Limit"] == "2"
+    assert response.headers["X-Offset"] == "1"
+
+
+def test_get_tasks_returns_the_requested_page(client, session_factory):
+    """Offset should select the correct page of an ordered result set."""
+    with session_factory() as session:
+        session.add_all(Task(title=f"Extra task {index}") for index in range(22))
+        session.commit()
+
+    response = client.get("/tasks", params={"limit": 10, "offset": 10})
+
+    assert response.status_code == 200
+    assert [task["id"] for task in response.json()] == list(range(11, 21))
+    assert response.headers["X-Total-Count"] == "25"
+    assert response.headers["X-Limit"] == "10"
+    assert response.headers["X-Offset"] == "10"
+
+
+@pytest.mark.parametrize(
+    ("params", "field"),
+    [
+        ({"limit": 0}, "limit"),
+        ({"limit": 101}, "limit"),
+        ({"limit": -1}, "limit"),
+        ({"limit": "not-an-integer"}, "limit"),
+        ({"offset": -1}, "offset"),
+        ({"offset": "not-an-integer"}, "offset"),
+    ],
+    ids=[
+        "limit-zero",
+        "limit-too-large",
+        "limit-negative",
+        "limit-not-integer",
+        "offset-negative",
+        "offset-not-integer",
+    ],
+)
+def test_get_tasks_rejects_invalid_pagination(client, params, field):
+    """limit and offset must satisfy their declared bounds."""
+    response = client.get("/tasks", params=params)
+
+    assert response.status_code == 422
+    assert any(
+        error["loc"] == ["query", field]
+        for error in response.json()["detail"]
+    )
+
+
+def test_get_tasks_returns_empty_page_for_out_of_range_offset(client):
+    """An offset past the last row should be an empty page, not an error."""
+    response = client.get("/tasks", params={"limit": 5, "offset": 100})
+
+    assert response.status_code == 200
+    assert response.json() == []
+    assert response.headers["X-Total-Count"] == str(len(SEED_TASKS))
+    assert response.headers["X-Limit"] == "5"
+    assert response.headers["X-Offset"] == "100"
+
+
+def test_pagination_headers_report_the_filtered_total(client):
+    """X-Total-Count must count matching rows, not just the returned page."""
+    client.post("/tasks", json={"title": "Finished one", "completed": True})
+    client.post("/tasks", json={"title": "Finished two", "completed": True})
+
+    response = client.get(
+        "/tasks",
+        params={"completed": "true", "limit": 1},
+    )
+
+    assert response.status_code == 200
+    assert len(response.json()) == 1
+    assert response.headers["X-Total-Count"] == "2"
+    assert response.headers["X-Limit"] == "1"
+    assert response.headers["X-Offset"] == "0"
+
+
+def test_get_tasks_searches_titles_case_insensitively(client):
+    """search should match a substring regardless of letter case."""
+    response = client.get("/tasks", params={"search": "fAsTaPi"})
+
+    assert response.status_code == 200
+    assert [task["id"] for task in response.json()] == [1]
+    assert response.headers["X-Total-Count"] == "1"
+
+
+def test_completed_filter_combines_with_title_search(client):
+    """Search and completed filters must both narrow the same result set."""
+    first = client.post(
+        "/tasks",
+        json={"title": "Learn SQL", "completed": True},
+    ).json()
+    second = client.post(
+        "/tasks",
+        json={"title": "learn docker", "completed": True},
+    ).json()
+    client.post("/tasks", json={"title": "Learn Testing", "completed": False})
+    client.post("/tasks", json={"title": "Unrelated", "completed": True})
+
+    page = client.get(
+        "/tasks",
+        params={"completed": "true", "search": "LEARN", "limit": 1},
+    )
+    full = client.get(
+        "/tasks",
+        params={"completed": "true", "search": "LEARN"},
+    )
+
+    assert page.status_code == full.status_code == 200
+    assert [task["id"] for task in page.json()] == [first["id"]]
+    assert [task["id"] for task in full.json()] == [first["id"], second["id"]]
+    assert page.headers["X-Total-Count"] == "2"
+    assert page.headers["X-Limit"] == "1"
+
+
+def test_search_treats_like_wildcards_as_literal_text(client):
+    """Percent and underscore in search must not act as SQL LIKE wildcards."""
+    percent_task = client.post("/tasks", json={"title": "100% complete"}).json()
+    underscore_task = client.post("/tasks", json={"title": "a_b task"}).json()
+
+    percent_response = client.get("/tasks", params={"search": "%"})
+    underscore_response = client.get("/tasks", params={"search": "_"})
+
+    assert [task["id"] for task in percent_response.json()] == [
+        percent_task["id"]
+    ]
+    assert [task["id"] for task in underscore_response.json()] == [
+        underscore_task["id"]
+    ]
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["", "x" * 101],
+    ids=["empty", "too-long"],
+)
+def test_get_tasks_rejects_invalid_search(client, value):
+    """Search must be a non-empty string no longer than a task title."""
+    response = client.get("/tasks", params={"search": value})
+
+    assert response.status_code == 422
+    assert any(
+        error["loc"] == ["query", "search"]
+        for error in response.json()["detail"]
+    )
+
+
+def test_sorting_is_applied_before_pagination(client):
+    """A descending page should be ordered before limit and offset run."""
+    response = client.get(
+        "/tasks",
+        params={"sort_by": "id", "sort_order": "desc", "limit": 2, "offset": 1},
+    )
+
+    assert response.status_code == 200
+    assert [task["id"] for task in response.json()] == [2, 1]
+    assert response.headers["X-Total-Count"] == str(len(SEED_TASKS))
+    assert response.headers["X-Limit"] == "2"
+    assert response.headers["X-Offset"] == "1"
+
+
+def test_sorting_uses_id_as_a_stable_tiebreaker(client):
+    """Rows with equal sort values must always come back in ascending ID order."""
+    completed_ties = client.get(
+        "/tasks",
+        params={"sort_by": "completed", "sort_order": "desc"},
+    )
+    first = client.post("/tasks", json={"title": "Same title"}).json()
+    second = client.post("/tasks", json={"title": "Same title"}).json()
+
+    ascending = client.get(
+        "/tasks",
+        params={"sort_by": "title", "sort_order": "asc"},
+    )
+    descending = client.get(
+        "/tasks",
+        params={"sort_by": "title", "sort_order": "desc"},
+    )
+
+    assert [task["id"] for task in completed_ties.json()] == [1, 2, 3]
+    expected_tie_order = [first["id"], second["id"]]
+    for response in (ascending, descending):
+        tied_ids = [
+            task["id"]
+            for task in response.json()
+            if task["title"] == "Same title"
+        ]
+        assert tied_ids == expected_tie_order
+
+
+def test_task_list_serializes_only_public_fields(client):
+    """List items should expose the public schema without internal fields."""
+    response = client.get("/tasks", params={"limit": 1})
+
+    assert response.status_code == 200
+    task = response.json()[0]
+    assert set(task) == {"id", "title", "completed", "created_at"}
+    assert isinstance(task["created_at"], str)
+    assert isinstance(datetime.fromisoformat(task["created_at"]), datetime)
+    assert response.headers["X-Total-Count"] == str(len(SEED_TASKS))
+
+
+def test_test_database_is_temporary_and_not_the_real_database(
+    client, session_factory, tmp_path
+):
+    """The client fixture must use a temporary file, never taskflow.db."""
+    with session_factory() as session:
+        database_path = Path(session.get_bind().url.database).resolve()
+
+    assert database_path != DATABASE_PATH.resolve()
+    assert tmp_path.resolve() in database_path.parents
+    assert get_db in main.app.dependency_overrides
+    assert len(client.get("/tasks").json()) == len(SEED_TASKS)
+
+
+def test_client_context_removes_the_dependency_override(session_factory):
+    """The client helper must restore app state even when a test finishes."""
+    assert get_db not in main.app.dependency_overrides
+
+    with api_client(session_factory) as isolated_client:
+        assert get_db in main.app.dependency_overrides
+        assert isolated_client.get("/tasks").status_code == 200
+
+    assert get_db not in main.app.dependency_overrides
+
+
+def test_api_requests_do_not_modify_the_real_database(client):
+    """API calls in tests must leave the development database untouched."""
+    if not DATABASE_PATH.exists():
+        pytest.skip("the local taskflow.db is not present")
+
+    before = DATABASE_PATH.stat()
+    response = client.post("/tasks", json={"title": "Temporary only"})
+    after = DATABASE_PATH.stat()
+
+    assert response.status_code == 201
+    assert after.st_size == before.st_size
+    assert after.st_mtime_ns == before.st_mtime_ns
+
+
 def test_create_task_returns_201(client):
     """Posting a valid task should create it with a server-assigned ID."""
     response = client.post(
@@ -226,7 +507,7 @@ def test_create_task_returns_201(client):
     assert response.status_code == 201
     created = response.json()
     assert without_server_fields(created) == {
-        "id": 3,
+        "id": 4,
         "title": "Write tests",
         "completed": True,
     }
@@ -309,7 +590,7 @@ def test_client_cannot_set_server_generated_fields_on_create(client):
 
     assert response.status_code == 201
     created = response.json()
-    assert created["id"] == 3
+    assert created["id"] == 4
     assert datetime.fromisoformat(created["created_at"]) > datetime(2000, 1, 1)
 
 
@@ -538,7 +819,7 @@ def test_create_task_uses_unique_id_after_deletion(client):
 
     assert response.status_code == 201
     created = response.json()
-    assert created["id"] == 3
+    assert created["id"] == 4
 
     task_ids = [task["id"] for task in client.get("/tasks").json()]
     assert len(task_ids) == len(set(task_ids))
@@ -551,7 +832,7 @@ def test_create_task_does_not_reuse_highest_id(client):
     response = client.post("/tasks", json={"title": "Another task"})
 
     assert response.status_code == 201
-    assert response.json()["id"] == 3
+    assert response.json()["id"] == 4
 
 
 def test_delete_task_returns_204_then_404(client):
@@ -561,7 +842,7 @@ def test_delete_task_returns_204_then_404(client):
     assert response.status_code == 204
     assert response.content == b""
     assert client.get("/tasks/1").status_code == 404
-    assert [task["id"] for task in client.get("/tasks").json()] == [2]
+    assert [task["id"] for task in client.get("/tasks").json()] == [2, 3]
 
     response = client.delete("/tasks/1")
 
