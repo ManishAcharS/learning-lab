@@ -3,15 +3,16 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Annotated, Literal
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 from sqlalchemy import func, select
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from database import get_db, init_db
-from models import Task
+from models import Task, User
+from security import hash_password
 
 
 @asynccontextmanager
@@ -62,6 +63,72 @@ def health():
         "status": "healthy",
         "message": "TaskFlow api is running"
     }
+
+
+class UserRegister(BaseModel):
+    email: EmailStr
+    password: str = Field(min_length=8, max_length=128)
+
+    @field_validator("email")
+    @classmethod
+    def normalize_email(cls, value: str) -> str:
+        return value.strip().lower()
+
+    @field_validator("password")
+    @classmethod
+    def validate_password_not_blank(cls, value: str) -> str:
+        if not value or not value.strip():
+            raise ValueError("password must not be empty or whitespace-only")
+        return value
+
+
+class UserRead(BaseModel):
+    """Safe public user representation excluding secrets."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    email: EmailStr
+    created_at: datetime
+
+
+@app.post("/auth/register", response_model=UserRead, status_code=status.HTTP_201_CREATED)
+def register(user_in: UserRegister, db: DbSession):
+    # Check if email is already registered
+    existing_user = db.scalar(select(User).where(User.email == user_in.email))
+    if existing_user is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Email already registered",
+        )
+
+    # Hash the password with Argon2id; never persist plaintext
+    hashed = hash_password(user_in.password)
+
+    new_user = User(
+        email=user_in.email,
+        hashed_password=hashed,
+    )
+    db.add(new_user)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Email already registered",
+        ) from None
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception("Database error during user registration")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=DATABASE_ERROR_DETAIL,
+        ) from None
+
+    db.refresh(new_user)
+    return new_user
+
 
 
 class TaskCreate(BaseModel):

@@ -1,20 +1,23 @@
-"""JWT access-token creation and verification.
-
-This module implements token mechanics only. User storage, password hashing,
-login endpoints, and refresh tokens are deliberately out of scope.
+"""Security utilities: JWT access-token mechanics and password hashing.
 
 The signing key is never defined here. Callers must provide it explicitly, and
 future API integration should load it from an environment variable such as
-``TASKFLOW_JWT_SECRET``. Never commit a real secret or log token values.
+``TASKFLOW_JWT_SECRET``. Never commit a real secret or log credentials/tokens.
 
 JWT payloads are signed, not encrypted: anyone holding a token can read its
 claims. Only non-sensitive identifiers and timestamps belong in the payload.
+
+Passwords are hashed using Argon2id via pwdlib, generating unique salts per hash.
 """
 
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import jwt
+from pwdlib import PasswordHash
+from pwdlib.hashers.argon2 import Argon2Hasher
+
+_password_hasher = PasswordHash((Argon2Hasher(),))
 
 JWT_ALGORITHM = "HS256"
 DEFAULT_ACCESS_TOKEN_EXPIRES = timedelta(minutes=30)
@@ -110,3 +113,43 @@ def decode_access_token(
         raise jwt.InvalidTokenError("sub must be a non-empty string")
 
     return payload
+
+
+def hash_password(password: str) -> str:
+    """Hash a plaintext password using Argon2id with a unique random salt.
+
+    Args:
+        password: Raw password string.
+
+    Returns:
+        Argon2id password hash string.
+
+    Raises:
+        ValueError: If password is empty or not a valid string.
+    """
+    if not isinstance(password, str) or not password:
+        raise ValueError("password must be a non-empty string")
+
+    return _password_hasher.hash(password)
+
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    """Verify a plaintext password against an Argon2id password hash.
+
+    Args:
+        plain_password: Raw password string.
+        hashed_password: Stored hash string.
+
+    Returns:
+        True if the password matches the hash, False otherwise.
+    """
+    if not isinstance(plain_password, str) or not plain_password:
+        return False
+    if not isinstance(hashed_password, str) or not hashed_password:
+        return False
+
+    try:
+        return _password_hasher.verify(plain_password, hashed_password)
+    except Exception:
+        return False
+

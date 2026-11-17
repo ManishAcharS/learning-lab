@@ -33,3 +33,22 @@ class Task(Base):
         nullable=False,
         server_default=func.now(),
     )
+
+
+class User(Base):
+    """A user persisted in the ``users`` table."""
+
+    __tablename__ = "users"
+    __table_args__ = (
+        {"sqlite_autoincrement": True},
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    email: Mapped[str] = mapped_column(String(255), unique=True, index=True, nullable=False)
+    hashed_password: Mapped[str] = mapped_column(String(255), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        nullable=False,
+        server_default=func.now(),
+    )
+

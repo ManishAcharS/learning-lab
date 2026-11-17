@@ -10,6 +10,8 @@ from security import (
     JWT_ALGORITHM,
     create_access_token,
     decode_access_token,
+    hash_password,
+    verify_password,
 )
 
 # Test-only credentials. Production code must load its signing key from the
@@ -149,3 +151,53 @@ def test_unapproved_signing_algorithm_is_rejected():
 
     with pytest.raises(jwt.InvalidAlgorithmError):
         decode_access_token(token, TEST_SECRET)
+
+
+def test_hash_generation_and_format():
+    password = "CorrectHorseBatteryStaple123!"
+    hashed = hash_password(password)
+
+    assert isinstance(hashed, str)
+    assert hashed.startswith("$argon2id$")
+
+
+def test_hash_differs_from_plaintext():
+    password = "SuperSecretPassword123!"
+    hashed = hash_password(password)
+
+    assert hashed != password
+    assert password not in hashed
+
+
+def test_same_password_produces_different_hashes():
+    password = "RepeatablePassword123!"
+    hash1 = hash_password(password)
+    hash2 = hash_password(password)
+
+    assert hash1 != hash2
+    assert hash1.startswith("$argon2id$")
+    assert hash2.startswith("$argon2id$")
+
+
+def test_correct_password_verification():
+    password = "MySecurePassword123!"
+    hashed = hash_password(password)
+
+    assert verify_password(password, hashed) is True
+
+
+def test_incorrect_password_verification():
+    password = "MySecurePassword123!"
+    hashed = hash_password(password)
+
+    assert verify_password("WrongPassword123!", hashed) is False
+    assert verify_password("", hashed) is False
+    assert verify_password(password, "") is False
+    assert verify_password(password, "invalid$argon2$hash") is False
+
+
+@pytest.mark.parametrize("invalid_password", ["", None, 12345, [], {}])
+def test_invalid_password_input_raises_value_error(invalid_password):
+    with pytest.raises(ValueError, match="password must be a non-empty string"):
+        hash_password(invalid_password)
+

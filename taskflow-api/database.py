@@ -48,7 +48,7 @@ def init_db() -> None:
     ``create_all`` only creates missing tables. It does not add or alter
     columns on an existing table, so real schema changes need a migration.
     """
-    # Import the model so its table is registered on Base.metadata.
-    from models import Task  # noqa: F401
+    # Import models so their tables are registered on Base.metadata.
+    from models import Task, User  # noqa: F401
 
     Base.metadata.create_all(bind=engine)
