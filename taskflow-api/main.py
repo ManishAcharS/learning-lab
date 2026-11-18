@@ -11,6 +11,7 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from database import get_db, init_db
+from deps import get_current_active_user
 from models import Task, User
 from security import hash_password
 
@@ -129,6 +130,11 @@ def register(user_in: UserRegister, db: DbSession):
     db.refresh(new_user)
     return new_user
 
+
+@app.get("/auth/me", response_model=UserRead)
+def get_me(current_user: Annotated[User, Depends(get_current_active_user)]):
+    """Return safe profile data for the authenticated user."""
+    return current_user
 
 
 class TaskCreate(BaseModel):
