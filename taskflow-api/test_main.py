@@ -12,7 +12,15 @@ from sqlalchemy.orm import Session, sessionmaker
 
 import main
 from database import DATABASE_PATH, Base, get_db
-from models import Task
+from deps import JWT_SECRET_ENV_VAR
+from models import Task, User
+from security import create_access_token, hash_password
+
+# Test-only signing key. Production code reads TASKFLOW_JWT_SECRET.
+TEST_SECRET = (
+    "test-only-main-suite-secret-never-use-in-production-"
+    "with-enough-length-for-hs256-tests"
+)
 
 SEED_TASKS = [
     {"id": 1, "title": "Learn FastAPI", "completed": False},
@@ -28,6 +36,12 @@ CLIENT_FIELDS = ("id", "title", "completed")
 def without_server_fields(task):
     """Drop database-generated fields before comparing with SEED_TASKS."""
     return {field: task[field] for field in CLIENT_FIELDS}
+
+
+@pytest.fixture(autouse=True)
+def configure_jwt_secret(monkeypatch):
+    """Provide a test signing key for task-route authentication."""
+    monkeypatch.setenv(JWT_SECRET_ENV_VAR, TEST_SECRET)
 
 
 @pytest.fixture
@@ -55,15 +69,30 @@ def session_factory(tmp_path):
         test_engine.dispose()
 
 
+@pytest.fixture
+def user_id(session_factory):
+    """Create the authenticated owner used by task API tests."""
+    with session_factory() as session:
+        user = User(
+            email="tasks-owner@example.com",
+            hashed_password=hash_password("SuperSecretPassword123!"),
+        )
+        session.add(user)
+        session.commit()
+        session.refresh(user)
+        return user.id
+
+
 @contextmanager
-def api_client(session_factory):
-    """Yield a TestClient backed by the fixture's temporary database."""
+def api_client(session_factory, user_id):
+    """Yield an authenticated TestClient using the fixture's temporary database."""
     with session_factory() as session:
         session.add_all(
             Task(
                 id=task["id"],
                 title=task["title"],
                 completed=task["completed"],
+                user_id=user_id,
             )
             for task in SEED_TASKS
         )
@@ -80,11 +109,15 @@ def api_client(session_factory):
         finally:
             session.close()
 
+    token = create_access_token(str(user_id), TEST_SECRET)
     main.app.dependency_overrides[get_db] = override_get_db
     # Entering the TestClient as a context manager would run the app lifespan,
     # which initializes the real development database. These tests create their
     # own schema, so they use the client without triggering that startup hook.
-    test_client = TestClient(main.app)
+    test_client = TestClient(
+        main.app,
+        headers={"Authorization": f"Bearer {token}"},
+    )
     try:
         yield test_client
     finally:
@@ -93,9 +126,9 @@ def api_client(session_factory):
 
 
 @pytest.fixture
-def client(session_factory):
+def client(session_factory, user_id):
     """Run each API test against its own temporary SQLite database."""
-    with api_client(session_factory) as test_client:
+    with api_client(session_factory, user_id) as test_client:
         yield test_client
 
 
@@ -235,10 +268,13 @@ def test_get_tasks_rejects_invalid_sort_parameters(client, params):
     )
 
 
-def test_get_tasks_defaults_to_first_20_items(client, session_factory):
+def test_get_tasks_defaults_to_first_20_items(client, session_factory, user_id):
     """Omitting pagination parameters should use limit=20 and offset=0."""
     with session_factory() as session:
-        session.add_all(Task(title=f"Extra task {index}") for index in range(22))
+        session.add_all(
+            Task(title=f"Extra task {index}", user_id=user_id)
+            for index in range(22)
+        )
         session.commit()
 
     response = client.get("/tasks")
@@ -261,10 +297,13 @@ def test_get_tasks_applies_custom_limit_and_offset(client):
     assert response.headers["X-Offset"] == "1"
 
 
-def test_get_tasks_returns_the_requested_page(client, session_factory):
+def test_get_tasks_returns_the_requested_page(client, session_factory, user_id):
     """Offset should select the correct page of an ordered result set."""
     with session_factory() as session:
-        session.add_all(Task(title=f"Extra task {index}") for index in range(22))
+        session.add_all(
+            Task(title=f"Extra task {index}", user_id=user_id)
+            for index in range(22)
+        )
         session.commit()
 
     response = client.get("/tasks", params={"limit": 10, "offset": 10})
@@ -472,11 +511,11 @@ def test_test_database_is_temporary_and_not_the_real_database(
     assert len(client.get("/tasks").json()) == len(SEED_TASKS)
 
 
-def test_client_context_removes_the_dependency_override(session_factory):
+def test_client_context_removes_the_dependency_override(session_factory, user_id):
     """The client helper must restore app state even when a test finishes."""
     assert get_db not in main.app.dependency_overrides
 
-    with api_client(session_factory) as isolated_client:
+    with api_client(session_factory, user_id) as isolated_client:
         assert get_db in main.app.dependency_overrides
         assert isolated_client.get("/tasks").status_code == 200
 
@@ -884,10 +923,10 @@ def test_duplicate_post_creates_two_separate_tasks(client):
     ["", "x" * 101],
     ids=["empty", "too-long"],
 )
-def test_database_rejects_invalid_title(session_factory, title):
+def test_database_rejects_invalid_title(session_factory, user_id, title):
     """The SQLite CHECK constraint must reject invalid data without the API."""
     with session_factory() as session:
-        session.add(Task(title=title))
+        session.add(Task(title=title, user_id=user_id))
         with pytest.raises(IntegrityError):
             session.commit()
         session.rollback()
@@ -898,11 +937,16 @@ def test_database_rejects_invalid_title(session_factory, title):
 
 def test_database_generates_defaults_for_completed_and_created_at(
     session_factory,
+    user_id,
 ):
     """Raw inserts must receive the database defaults, not only ORM defaults."""
     with session_factory() as session:
         session.execute(
-            text("INSERT INTO tasks (title) VALUES ('Database defaults')")
+            text(
+                "INSERT INTO tasks (title, user_id) "
+                "VALUES ('Database defaults', :user_id)"
+            ),
+            {"user_id": user_id},
         )
         session.commit()
 

@@ -4,6 +4,9 @@ A small task-management REST API built with FastAPI, Pydantic 2, the
 SQLAlchemy 2.x ORM, and SQLite. It supports paginated, searchable, filtered
 listing, plus creating, retrieving, partially updating, and deleting tasks.
 Tasks are persisted in `taskflow.db`, so they survive an application restart.
+Every task belongs to exactly one registered user, and all `/tasks` endpoints
+require a valid Bearer JWT. Users can only list, read, update, and delete their
+own tasks.
 
 ## Request lifecycle
 
@@ -14,21 +17,25 @@ Tasks are persisted in `taskflow.db`, so they survive an application restart.
    whitespace-only, wrong-typed, or over-100-character title, or an explicit
    `null`) produces an automatic `422 Unprocessable Entity` response, and the
    endpoint is not called.
-4. FastAPI resolves the `get_db` dependency, which opens one SQLAlchemy session
+4. FastAPI resolves `get_current_active_user`, which verifies the Bearer JWT and
+   loads the user identified by its `sub` claim. Missing or invalid credentials
+   produce `401` before the endpoint runs.
+5. FastAPI resolves the `get_db` dependency, which opens one SQLAlchemy session
    for the request and promises to close it afterward.
-5. The endpoint uses that session to read or modify `Task` ORM objects. Writes
+6. The endpoint uses that session to read or modify `Task` ORM objects. Writes
    are committed only after validation succeeds and go through `commit_changes()`;
    created or updated objects are refreshed so database defaults are available.
    An unknown ID raises `HTTPException(404)`. A database commit failure rolls the
    session back and returns a generic `500`, never a success response.
-6. FastAPI serializes the ORM object through the `TaskRead` response model and
+7. FastAPI serializes the ORM object through the `TaskRead` response model and
    sends it with the route's status code (`200`, `201`, or `204`).
-7. The `get_db` dependency rolls back on an endpoint exception, then closes the
+8. The `get_db` dependency rolls back on an endpoint exception, then closes the
    session in a `finally` block, even when the endpoint raises.
 
 ```text
 Client -> Uvicorn -> FastAPI router -> Pydantic validation
-       -> get_db dependency (Session) -> SQLAlchemy ORM -> SQLite
+       -> JWT dependency (current user) -> get_db dependency (Session)
+       -> SQLAlchemy ORM -> SQLite
        <- JSON response <- TaskRead <- session closed in finally
 ```
 
@@ -37,9 +44,11 @@ Client -> Uvicorn -> FastAPI router -> Pydantic validation
 | File | Responsibility |
 | --- | --- |
 | `database.py` | Stable database path, SQLAlchemy engine, `SessionLocal`, declarative `Base`, `get_db`, and `init_db`. |
-| `models.py` | The `Task` ORM model mapped to the `tasks` table. |
-| `main.py` | FastAPI app, request/response schemas, and ORM-based endpoints. |
+| `models.py` | The `User` and `Task` ORM models, including the ownership relationship. |
+| `main.py` | FastAPI app, request/response schemas, and ownership-aware ORM endpoints. |
+| `migrate_task_ownership.py` | Explicit one-off migration for legacy databases; never guesses an owner. |
 | `test_main.py` | API tests, each using an isolated temporary SQLite database. |
+| `test_ownership.py` | Two-user isolation and 403 authorization tests. |
 
 The database URL is built from `Path(__file__).resolve().parent`, so
 `taskflow.db` is always the file next to the application code, regardless of the
@@ -55,15 +64,21 @@ terminal's current working directory.
 | `title` | `VARCHAR(100)` | Required; a database `CHECK` also enforces 1–100 characters. |
 | `completed` | `BOOLEAN` | Required; defaults to `false` (`0` in SQLite). |
 | `created_at` | `DATETIME` | Required; defaults to the database's `CURRENT_TIMESTAMP`. |
+| `user_id` | `INTEGER` | Required foreign key to `users.id`; indexed; cascades on user deletion. |
+
+`models.User` maps to `users` (`id`, unique indexed `email`, `hashed_password`,
+and `created_at`). `Task.user` and `User.tasks` are the matching ORM
+relationship.
 
 The ORM model is the persistence model: it describes the table and its
 constraints. The Pydantic models are transport models: `TaskCreate` and
 `TaskUpdate` validate incoming JSON, while `TaskRead` controls the response
 shape. `TaskRead` uses `from_attributes=True` to serialize ORM objects and
-exposes `id`, `title`, `completed`, and the database-generated `created_at`
-timestamp. `TaskCreate` and `TaskUpdate` do not define `id` or `created_at`, so
-clients cannot set those server-owned fields; values for them are ignored if
-sent.
+exposes the same public fields as before: `id`, `title`, `completed`, and the
+database-generated `created_at` timestamp. `user_id` is intentionally not part
+of the request or response schemas. `TaskCreate` and `TaskUpdate` do not define
+`id`, `created_at`, or `user_id`, so clients cannot set those server-owned
+fields; values for them are ignored if sent.
 
 ### Table creation and existing data
 
@@ -71,12 +86,33 @@ sent.
 `Base.metadata.create_all(bind=engine)`. This only creates missing tables. It
 does **not** add columns, change types, or otherwise migrate an existing table.
 
-The existing `taskflow.db` was inspected before these changes. Its `tasks` table
-already has `id`, `title`, `completed`, and `created_at` with compatible
-constraints and defaults, and it contains existing practice rows. No migration
-was needed, and the file and its data were left intact. If the schema must change in
-the future, back up `taskflow.db` and apply a deliberate migration (for example,
-with Alembic or reviewed SQL); do not delete the database to force a new schema.
+The existing local `taskflow.db` was inspected before this change. It contains
+18 task rows, has no `users` table, and has no `user_id` column. Those legacy
+rows have no recorded owner, so they cannot be assigned safely by application
+code. This change therefore leaves that file untouched and never guesses an
+owner.
+
+Because the project has no migration framework, `migrate_task_ownership.py`
+performs the standard SQLite table rebuild explicitly:
+
+```powershell
+# Start the API once so init_db() creates the missing users table, register the
+# intended owner, then stop the API before running the migration.
+python migrate_task_ownership.py --user-email owner@example.com --dry-run
+python migrate_task_ownership.py --user-email owner@example.com
+```
+
+The script requires exactly one explicit `--user-id` or `--user-email`, refuses
+to run without an existing matching user, backs up the database file first,
+copies every row with its original ID and `created_at`, adds the non-nullable
+foreign key and index, checks foreign keys, and wraps the table swap in one
+transaction. It never assigns legacy tasks to an arbitrary user.
+
+Migration limitations: it is a one-off local SQLite tool, not versioned
+migration history; it requires the API to be stopped; it rebuilds the `tasks`
+table, so the backup (not an automatic rollback command) is the recovery path;
+and it should not be used as a substitute for Alembic in a shared or production
+database.
 
 ### Session lifecycle
 
@@ -105,24 +141,37 @@ cleanup, and lets tests replace the real database session with an isolated one.
 
 ## Endpoints
 
+All `/tasks` endpoints require a valid Bearer JWT. `/health`, registration, and
+`/auth/me` are separate; see the authentication sections below.
+
 | Method | Path | Purpose | Success status |
 | --- | --- | --- | --- |
 | `GET` | `/health` | Check that the API is running and healthy. | `200` |
-| `GET` | `/tasks` | List tasks from SQLite. Supports optional `completed`, `search`, `sort_by`, `sort_order`, `limit`, and `offset` query parameters; defaults to the first 20 tasks ordered by ID. | `200` |
-| `POST` | `/tasks` | Create a task from a `title` and optional `completed` value. The database assigns the ID. | `201` |
-| `GET` | `/tasks/{task_id}` | Retrieve one task by ID. | `200` |
-| `PATCH` | `/tasks/{task_id}` | Partially update `title` and/or `completed`. Omitted fields are left unchanged. | `200` |
-| `DELETE` | `/tasks/{task_id}` | Delete a task by ID. | `204` |
+| `GET` | `/tasks` | List only the authenticated user's tasks. Supports optional `completed`, `search`, `sort_by`, `sort_order`, `limit`, and `offset` query parameters; defaults to the first 20 owned tasks ordered by ID. | `200` |
+| `POST` | `/tasks` | Create a task owned by the authenticated user from a `title` and optional `completed` value. The database assigns the ID. | `201` |
+| `GET` | `/tasks/{task_id}` | Retrieve one task only if the authenticated user owns it. | `200` |
+| `PATCH` | `/tasks/{task_id}` | Partially update `title` and/or `completed` on an owned task. Omitted fields are left unchanged. | `200` |
+| `DELETE` | `/tasks/{task_id}` | Delete an owned task by ID. | `204` |
 
-Requests for a task ID that does not exist return `404` with
-`{"detail": "Task not found"}`. A path value that is not an integer (for
-example, `/tasks/not-a-number` or `/tasks/1.5`) fails path validation with
-`422` before the endpoint runs.
+Ownership is enforced in SQL for listing and by an explicit owner comparison for
+single-resource operations. A task that exists but belongs to another user
+returns `403` with `{"detail": "Not authorized to access this task"}`. That
+message never includes the task contents or the owner's identity. A task ID that
+does not exist returns `404` with `{"detail": "Task not found"}`, preserving the
+previous behavior. A path value that is not an integer (for example,
+`/tasks/not-a-number` or `/tasks/1.5`) fails path validation with `422` before
+the endpoint runs.
+
+`POST /tasks` always takes ownership from the verified JWT subject. A
+client-supplied `user_id` is ignored. `PATCH /tasks/{task_id}` cannot change
+ownership because `TaskUpdate` only accepts `title` and `completed`.
 
 ### Error responses
 
 | Status | Cause | Response body |
 | --- | --- | --- |
+| `401` | JWT is missing, malformed, expired, tampered with, or references no user | `{"detail": "Could not validate credentials"}` |
+| `403` | The task exists but belongs to another user | `{"detail": "Not authorized to access this task"}` |
 | `422` | Body, query, or path validation fails | FastAPI's validation `detail` list |
 | `404` | No task exists with the requested ID | `{"detail": "Task not found"}` |
 | `500` | A database operation fails unexpectedly | `{"detail": "Database operation failed"}` |
@@ -139,6 +188,8 @@ those details are logged on the server for operators.
   real content may contain or be surrounded by whitespace, which is preserved.
 - `id` and `created_at` are generated by the server. Supplying them in a
   `POST` or `PATCH` body does not set them; the API ignores those extra fields.
+- `user_id` is also server-owned: it always comes from the verified JWT. Sending
+  it in a `POST` or `PATCH` body is ignored and cannot transfer ownership.
 - `completed` must be a boolean. Wrong JSON types (for example, a numeric title,
   an object for `completed`, or a non-boolean string) are rejected with `422`.
 - On `PATCH`, fields may be omitted to keep their current values. An empty body
@@ -218,9 +269,13 @@ whose `X-Total-Count` still reports the full filtered total.
 
 ### Example requests
 
+Every `/tasks` example below needs an access token. Register a user, obtain a
+JWT signed with `TASKFLOW_JWT_SECRET` for that user's ID, and send it as
+`Authorization: Bearer <token>`. The examples omit that header for brevity.
+
 ```bash
-# List all tasks
-curl http://127.0.0.1:8000/tasks
+# List the authenticated user's tasks
+curl http://127.0.0.1:8000/tasks -H "Authorization: Bearer $TASKFLOW_TOKEN"
 
 # Create a task -> 201 with id, title, completed, and created_at
 curl -X POST http://127.0.0.1:8000/tasks \
@@ -272,15 +327,22 @@ Interactive API documentation is available at `/docs` (Swagger UI) and
 
 ```text
 taskflow-api/
-|-- main.py              # FastAPI app, Pydantic schemas, CRUD endpoints
-|-- database.py          # Engine, Base, SessionLocal, get_db, init_db
-|-- models.py            # Task SQLAlchemy ORM model
-|-- test_main.py         # API tests with isolated temporary databases
-|-- database_practice.py # Standalone sqlite3 practice script (unchanged)
-|-- requirements.txt     # Pinned runtime dependencies
-|-- requirements-dev.txt # Runtime plus test dependencies
-|-- .gitignore           # Local databases, caches, and secret files
-|-- taskflow.db          # Local development database (not tracked)
+|-- main.py                     # FastAPI app, schemas, ownership-aware CRUD
+|-- database.py                 # Engine, Base, SessionLocal, get_db, init_db
+|-- models.py                   # User/Task ORM models and relationship
+|-- deps.py                     # JWT authentication dependency
+|-- security.py                 # JWT and password hashing utilities
+|-- migrate_task_ownership.py   # Explicit legacy-data ownership migration
+|-- test_main.py                # API tests with isolated temporary databases
+|-- test_ownership.py           # Two-user ownership/isolation tests
+|-- test_auth.py                # Registration tests
+|-- test_auth_deps.py           # Authentication dependency tests
+|-- test_security.py            # JWT/password utility tests
+|-- database_practice.py        # Standalone sqlite3 practice script (unchanged)
+|-- requirements.txt            # Pinned runtime dependencies
+|-- requirements-dev.txt        # Runtime plus test dependencies
+|-- .gitignore                  # Local databases, caches, and secret files
+|-- taskflow.db                 # Local development database (not tracked)
 `-- README.md
 ```
 
@@ -303,16 +365,24 @@ or newer.
 On macOS or Linux, activate the environment with
 `source .venv/bin/activate` instead.
 
-The suite currently contains 87 tests. Each test creates a fresh SQLite file
-under pytest's `tmp_path`, creates the schema from the ORM metadata, seeds three
-known tasks, and installs a `get_db` dependency override. The test-client
-helper always removes that override, and each request-scoped session is closed
-in a `finally` block. The temporary database is discarded afterward, so tests
-never delete or modify the real `taskflow.db`, and one test cannot leak state
-into another. The test override also rolls back on exceptions, matching the
-production dependency.
+The suite currently contains 161 tests. Each test creates a fresh SQLite file
+under pytest's `tmp_path`, creates the schema from the ORM metadata, and installs
+a `get_db` dependency override. Task API tests seed three known tasks owned by a
+temporary test user and authenticate with that user's signed JWT. The
+test-client helper always removes the override, and each request-scoped session
+is closed in a `finally` block. The temporary database is discarded afterward,
+so tests never delete or modify the real `taskflow.db`, and one test cannot leak
+state into another. The test override also rolls back on exceptions, matching
+the production dependency.
 Focused isolation tests verify the temporary database path, override cleanup,
 and that the real development database file is unchanged.
+
+`test_ownership.py` registers two independent users through the real
+registration endpoint and authenticates each with a genuine JWT. It verifies
+separate task creation, owner-only listing, reading, updating, and deleting,
+403 responses for another user's existing task, unchanged data after failed
+updates/deletes, ignored client-supplied `user_id` on create and patch, 404 for
+nonexistent tasks, and 401 for unauthenticated task requests.
 
 The tests cover the health check, task listing and retrieval, creation and
 validation (including missing, empty, whitespace-only, wrong-typed, and
@@ -344,10 +414,12 @@ On startup, missing tables are created in `taskflow.db`. Then open
 
 ## Current limitations
 
-- **No authentication or authorization.** Every caller can read and modify all
-  tasks.
+- **Authentication required; no roles or admin features.** Task routes are
+  restricted to the authenticated owner. Existing tasks cannot be assigned an
+  owner automatically.
 - **No migration framework.** `create_all()` only creates missing tables;
-  changing an existing schema requires a separate migration.
+  changing an existing schema requires the separate, explicit migration script
+  or a tool such as Alembic.
 - **SQLite only.** The project is intended for local learning and small
   workloads, not for high-concurrency or multi-server deployment.
 - **Simple substring search.** `search` uses SQL `LIKE` on `title`; there is no

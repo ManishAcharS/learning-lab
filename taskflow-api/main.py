@@ -27,9 +27,11 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Taskflow API", lifespan=lifespan)
 
 DbSession = Annotated[Session, Depends(get_db)]
+CurrentUser = Annotated[User, Depends(get_current_active_user)]
 
 logger = logging.getLogger(__name__)
 DATABASE_ERROR_DETAIL = "Database operation failed"
+OWNERSHIP_ERROR_DETAIL = "Not authorized to access this task"
 
 
 @app.exception_handler(SQLAlchemyError)
@@ -183,6 +185,26 @@ class TaskRead(BaseModel):
     created_at: datetime
 
 
+def get_owned_task(db: Session, task_id: int, current_user: User) -> Task:
+    """Return a task only when it belongs to ``current_user``.
+
+    A missing task keeps the existing 404 behavior. An existing task owned by
+    someone else returns 403 without exposing its contents or owner details.
+    """
+    task = db.get(Task, task_id)
+    if task is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Task not found",
+        )
+    if task.user_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=OWNERSHIP_ERROR_DETAIL,
+        )
+    return task
+
+
 SortField = Literal["id", "title", "completed"]
 SortOrder = Literal["asc", "desc"]
 
@@ -205,6 +227,7 @@ def escape_like_pattern(value: str) -> str:
 @app.get("/tasks", response_model=list[TaskRead])
 def get_tasks(
     db: DbSession,
+    current_user: CurrentUser,
     response: Response,
     completed: bool | None = None,
     search: Annotated[str | None, Query(min_length=1, max_length=100)] = None,
@@ -213,7 +236,9 @@ def get_tasks(
     limit: Annotated[int, Query(ge=1, le=MAX_PAGE_LIMIT)] = DEFAULT_PAGE_LIMIT,
     offset: Annotated[int, Query(ge=0)] = 0,
 ):
-    filters = []
+    # Ownership is part of every query, including the count, so users can never
+    # observe another user's tasks through listing, search, or pagination.
+    filters = [Task.user_id == current_user.id]
 
     # Filter in SQL; False must still apply, so compare explicitly to None.
     if completed is not None:
@@ -250,8 +275,13 @@ def get_tasks(
 
 
 @app.post("/tasks", response_model=TaskRead, status_code=201)
-def create_task(task: TaskCreate, db: DbSession):
-    new_task = Task(title=task.title, completed=task.completed)
+def create_task(task: TaskCreate, db: DbSession, current_user: CurrentUser):
+    # Ownership always comes from the verified token, never the request body.
+    new_task = Task(
+        title=task.title,
+        completed=task.completed,
+        user_id=current_user.id,
+    )
     db.add(new_task)
     commit_changes(db)
     db.refresh(new_task)
@@ -259,39 +289,32 @@ def create_task(task: TaskCreate, db: DbSession):
 
 
 @app.get("/tasks/{task_id}", response_model=TaskRead)
-def get_task(task_id: int, db: DbSession):
-    task = db.get(Task, task_id)
-    if task is not None:
-        return task
-
-    raise HTTPException(
-        status_code=404,
-        detail="Task not found"
-    )
+def get_task(task_id: int, db: DbSession, current_user: CurrentUser):
+    return get_owned_task(db, task_id, current_user)
 
 
 @app.patch("/tasks/{task_id}", response_model=TaskRead)
-def update_task(task_id: int, update: TaskUpdate, db: DbSession):
-    task = db.get(Task, task_id)
-    if task is not None:
-        # Keep omitted fields unchanged during a partial update.
-        changes = update.model_dump(exclude_unset=True)
-        for field, value in changes.items():
-            setattr(task, field, value)
+def update_task(
+    task_id: int,
+    update: TaskUpdate,
+    db: DbSession,
+    current_user: CurrentUser,
+):
+    task = get_owned_task(db, task_id, current_user)
 
-        commit_changes(db)
-        db.refresh(task)
-        return task
+    # Keep omitted fields unchanged during a partial update. TaskUpdate only
+    # exposes title/completed, so user_id can never be changed by a request.
+    changes = update.model_dump(exclude_unset=True)
+    for field, value in changes.items():
+        setattr(task, field, value)
 
-    raise HTTPException(status_code=404, detail="Task not found")
+    commit_changes(db)
+    db.refresh(task)
+    return task
 
 
 @app.delete("/tasks/{task_id}", status_code=204)
-def delete_task(task_id: int, db: DbSession):
-    task = db.get(Task, task_id)
-    if task is not None:
-        db.delete(task)
-        commit_changes(db)
-        return
-
-    raise HTTPException(status_code=404, detail="Task not found")
+def delete_task(task_id: int, db: DbSession, current_user: CurrentUser):
+    task = get_owned_task(db, task_id, current_user)
+    db.delete(task)
+    commit_changes(db)

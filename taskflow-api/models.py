@@ -2,14 +2,14 @@
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, CheckConstraint, DateTime, Integer, String, func, text
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Integer, String, func, text
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from database import Base
 
 
 class Task(Base):
-    """A task persisted in the ``tasks`` table."""
+    """A task persisted in the ``tasks`` table and owned by one user."""
 
     __tablename__ = "tasks"
     __table_args__ = (
@@ -33,6 +33,13 @@ class Task(Base):
         nullable=False,
         server_default=func.now(),
     )
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    user: Mapped["User"] = relationship(back_populates="tasks")
 
 
 class User(Base):
@@ -50,5 +57,10 @@ class User(Base):
         DateTime,
         nullable=False,
         server_default=func.now(),
+    )
+
+    tasks: Mapped[list[Task]] = relationship(
+        back_populates="user",
+        cascade="all, delete-orphan",
     )
 

@@ -29,6 +29,7 @@ id_ed25519*
 *.db-journal
 *.db-wal
 *.db-shm
+*.db.bak-*
 
 # Test and coverage output
 .coverage
