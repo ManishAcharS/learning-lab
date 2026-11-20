@@ -1,8 +1,9 @@
 """Reusable FastAPI authentication dependencies.
 
-Access tokens are issued by a future login flow (intentionally out of scope).
-The JWT ``sub`` claim is the decimal string form of ``User.id``; registration
-returns numeric user IDs, and user IDs are stable even if an email changes.
+Access tokens are issued by ``POST /auth/login`` and use the OAuth2 password
+flow. The JWT ``sub`` claim is the decimal string form of ``User.id``;
+registration returns numeric user IDs, and user IDs are stable even if an email
+changes.
 
 The signing key is read from ``TASKFLOW_JWT_SECRET`` for each request. There is
 deliberately no fallback secret: a missing configuration is a deployment error.
@@ -13,7 +14,7 @@ from typing import Annotated
 
 import jwt
 from fastapi import Depends, HTTPException, status
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
 
 from database import get_db
@@ -22,11 +23,17 @@ from security import decode_access_token
 
 JWT_SECRET_ENV_VAR = "TASKFLOW_JWT_SECRET"
 
-bearer_scheme = HTTPBearer(auto_error=False)
+# ``auto_error=False`` keeps the dependency's single generic 401 response for
+# missing, malformed, and non-Bearer credentials. The token URL is the actual
+# mounted login route so OpenAPI's "Authorize" flow works.
+bearer_scheme = OAuth2PasswordBearer(
+    tokenUrl="/auth/login",
+    auto_error=False,
+)
 
 DbSession = Annotated[Session, Depends(get_db)]
-BearerCredentials = Annotated[
-    HTTPAuthorizationCredentials | None,
+AccessToken = Annotated[
+    str | None,
     Depends(bearer_scheme),
 ]
 
@@ -58,7 +65,7 @@ def get_jwt_secret() -> str:
 
 
 def get_current_active_user(
-    credentials: BearerCredentials,
+    credentials: AccessToken,
     db: DbSession,
 ) -> User:
     """Return the registered user identified by a valid Bearer JWT.
@@ -71,13 +78,13 @@ def get_current_active_user(
             missing, malformed, expired, tampered with, signed by another key,
             has an invalid subject, or references a user that does not exist.
     """
-    if credentials is None or credentials.scheme.lower() != "bearer":
+    if credentials is None:
         raise _unauthorized()
 
     secret = get_jwt_secret()
 
     try:
-        payload = decode_access_token(credentials.credentials, secret)
+        payload = decode_access_token(credentials, secret)
     except jwt.InvalidTokenError:
         raise _unauthorized() from None
 

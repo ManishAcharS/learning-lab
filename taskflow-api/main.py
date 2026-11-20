@@ -5,15 +5,16 @@ from typing import Annotated, Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.responses import JSONResponse
+from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from database import get_db, init_db
-from deps import get_current_active_user
+from deps import get_current_active_user, get_jwt_secret
 from models import Task, User
-from security import hash_password
+from security import create_access_token, hash_password, verify_password
 
 
 @asynccontextmanager
@@ -131,6 +132,47 @@ def register(user_in: UserRegister, db: DbSession):
 
     db.refresh(new_user)
     return new_user
+
+
+class Token(BaseModel):
+    """OAuth2-compatible access-token response; contains no user secrets."""
+
+    access_token: str
+    token_type: str = "bearer"
+
+
+LOGIN_ERROR_DETAIL = "Incorrect email or password"
+
+
+@app.post("/auth/login", response_model=Token)
+def login(
+    form_data: Annotated[OAuth2PasswordRequestForm, Depends()],
+    db: DbSession,
+    secret: Annotated[str, Depends(get_jwt_secret)],
+):
+    """Authenticate an email/password pair and issue a Bearer access token.
+
+    ``username`` carries the registered email address. Unknown emails and wrong
+    passwords produce the same generic 401 so the endpoint cannot be used to
+    enumerate accounts.
+    """
+    # Match registration's normalization so case/whitespace variants still log in.
+    email = form_data.username.strip().lower()
+    user = db.scalar(select(User).where(User.email == email))
+
+    if user is None or not verify_password(
+        form_data.password,
+        user.hashed_password,
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=LOGIN_ERROR_DETAIL,
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # Existing contract: the JWT subject is the decimal string form of User.id.
+    access_token = create_access_token(str(user.id), secret)
+    return Token(access_token=access_token, token_type="bearer")
 
 
 @app.get("/auth/me", response_model=UserRead)
