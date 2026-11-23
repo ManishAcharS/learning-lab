@@ -7,6 +7,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, s
 from fastapi.responses import JSONResponse
 from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
+from slowapi.errors import RateLimitExceeded
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -14,6 +15,7 @@ from sqlalchemy.orm import Session
 from database import get_db, init_db
 from deps import get_current_active_user, get_jwt_secret
 from models import Task, User
+from rate_limit import limiter, rate_limit_exceeded_handler
 from security import create_access_token, hash_password, verify_password
 
 
@@ -26,6 +28,11 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Taskflow API", lifespan=lifespan)
+
+# SlowAPI keeps its limiter on app.state and needs the matching exception
+# handler for RateLimitExceeded. Only decorated routes consume the limit.
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, rate_limit_exceeded_handler)
 
 DbSession = Annotated[Session, Depends(get_db)]
 CurrentUser = Annotated[User, Depends(get_current_active_user)]
@@ -145,7 +152,10 @@ LOGIN_ERROR_DETAIL = "Incorrect email or password"
 
 
 @app.post("/auth/login", response_model=Token)
+@limiter.limit("5/minute")
 def login(
+    request: Request,
+    response: Response,
     form_data: Annotated[OAuth2PasswordRequestForm, Depends()],
     db: DbSession,
     secret: Annotated[str, Depends(get_jwt_secret)],
@@ -155,6 +165,10 @@ def login(
     ``username`` carries the registered email address. Unknown emails and wrong
     passwords produce the same generic 401 so the endpoint cannot be used to
     enumerate accounts.
+
+    The endpoint is limited to five requests per minute per client IP. The
+    ``request`` parameter is required by SlowAPI, and ``response`` lets SlowAPI
+    attach rate-limit headers to successful responses.
     """
     # Match registration's normalization so case/whitespace variants still log in.
     email = form_data.username.strip().lower()
