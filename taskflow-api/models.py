@@ -1,8 +1,8 @@
 """SQLAlchemy ORM models for TaskFlow."""
 
-from datetime import datetime
+from datetime import date, datetime
 
-from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Integer, String, func, text
+from sqlalchemy import Boolean, CheckConstraint, Date, DateTime, ForeignKey, Integer, String, func, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from database import Base
@@ -14,14 +14,16 @@ class Task(Base):
     __tablename__ = "tasks"
     __table_args__ = (
         CheckConstraint(
-            "length(title) BETWEEN 1 AND 100",
+            "length(title) BETWEEN 1 AND 120",
             name="ck_tasks_title_length",
         ),
         {"sqlite_autoincrement": True},
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    title: Mapped[str] = mapped_column(String(100), nullable=False)
+    title: Mapped[str] = mapped_column(String(120), nullable=False)
+    description: Mapped[str | None] = mapped_column(String(2000), nullable=True)
+    due_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     completed: Mapped[bool] = mapped_column(
         Boolean,
         nullable=False,
@@ -40,6 +42,11 @@ class Task(Base):
     )
 
     user: Mapped["User"] = relationship(back_populates="tasks")
+
+    @property
+    def status(self) -> str:
+        """Expose the app's existing binary task state as a stable API value."""
+        return "completed" if self.completed else "pending"
 
 
 class User(Base):

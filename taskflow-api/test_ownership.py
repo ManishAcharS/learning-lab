@@ -127,7 +127,15 @@ def test_user_a_can_create_a_task(client, users, session_factory):
     assert response.status_code == 201
     created = response.json()
     assert created["title"] == "Alice task"
-    assert set(created) == {"id", "title", "completed", "created_at"}
+    assert set(created) == {
+        "id",
+        "title",
+        "description",
+        "status",
+        "completed",
+        "due_date",
+        "created_at",
+    }
 
     with session_factory() as session:
         stored = session.get(Task, created["id"])

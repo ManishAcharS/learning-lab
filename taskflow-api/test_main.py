@@ -38,6 +38,13 @@ def without_server_fields(task):
     return {field: task[field] for field in CLIENT_FIELDS}
 
 
+def validation_error_fields(response):
+    """Return the standardized validation field list after checking its shape."""
+    payload = response.json()
+    assert payload["error"] == "validation_error"
+    return payload["fields"]
+
+
 @pytest.fixture(autouse=True)
 def configure_jwt_secret(monkeypatch):
     """Provide a test signing key for task-route authentication."""
@@ -205,8 +212,8 @@ def test_get_tasks_rejects_invalid_completed_filter(client, value):
 
     assert response.status_code == 422
     assert any(
-        error["loc"] == ["query", "completed"]
-        for error in response.json()["detail"]
+        error["field"] == "completed"
+        for error in validation_error_fields(response)
     )
 
 
@@ -263,8 +270,8 @@ def test_get_tasks_rejects_invalid_sort_parameters(client, params):
     assert response.status_code == 422
     field = next(iter(params))
     assert any(
-        error["loc"] == ["query", field]
-        for error in response.json()["detail"]
+        error["field"] == field
+        for error in validation_error_fields(response)
     )
 
 
@@ -340,8 +347,8 @@ def test_get_tasks_rejects_invalid_pagination(client, params, field):
 
     assert response.status_code == 422
     assert any(
-        error["loc"] == ["query", field]
-        for error in response.json()["detail"]
+        error["field"] == field
+        for error in validation_error_fields(response)
     )
 
 
@@ -438,8 +445,8 @@ def test_get_tasks_rejects_invalid_search(client, value):
 
     assert response.status_code == 422
     assert any(
-        error["loc"] == ["query", "search"]
-        for error in response.json()["detail"]
+        error["field"] == "search"
+        for error in validation_error_fields(response)
     )
 
 
@@ -492,7 +499,15 @@ def test_task_list_serializes_only_public_fields(client):
 
     assert response.status_code == 200
     task = response.json()[0]
-    assert set(task) == {"id", "title", "completed", "created_at"}
+    assert set(task) == {
+        "id",
+        "title",
+        "description",
+        "status",
+        "completed",
+        "due_date",
+        "created_at",
+    }
     assert isinstance(task["created_at"], str)
     assert isinstance(datetime.fromisoformat(task["created_at"]), datetime)
     assert response.headers["X-Total-Count"] == str(len(SEED_TASKS))
@@ -607,8 +622,8 @@ def test_create_task_defaults_completed_to_false(client, session_factory):
 
 
 def test_create_task_accepts_title_at_max_length(client):
-    """Exactly 100 characters is valid; the limit must not be off by one."""
-    title = "x" * 100
+    """Exactly 120 characters is valid; the limit must not be off by one."""
+    title = "x" * 120
 
     response = client.post("/tasks", json={"title": title})
 
@@ -665,8 +680,8 @@ def test_create_task_rejects_whitespace_only_title(client):
 
     assert response.status_code == 422
     assert any(
-        error["loc"] == ["body", "title"]
-        for error in response.json()["detail"]
+        error["field"] == "title"
+        for error in validation_error_fields(response)
     )
     assert [
         without_server_fields(task) for task in client.get("/tasks").json()
@@ -694,13 +709,13 @@ def test_create_task_rejects_invalid_field_types(client, payload):
 
 
 def test_create_task_rejects_excessively_long_title(client):
-    """A title over the 100-character limit should be rejected atomically."""
-    response = client.post("/tasks", json={"title": "x" * 101})
+    """A title over the 120-character limit should be rejected atomically."""
+    response = client.post("/tasks", json={"title": "x" * 121})
 
     assert response.status_code == 422
     assert any(
-        error["loc"] == ["body", "title"]
-        for error in response.json()["detail"]
+        error["field"] == "title"
+        for error in validation_error_fields(response)
     )
     assert [
         without_server_fields(task) for task in client.get("/tasks").json()
@@ -734,8 +749,8 @@ def test_get_task_rejects_invalid_path_parameter(client, task_id):
 
     assert response.status_code == 422
     assert any(
-        error["loc"] == ["path", "task_id"]
-        for error in response.json()["detail"]
+        error["field"] == "task_id"
+        for error in validation_error_fields(response)
     )
 
 
@@ -787,8 +802,8 @@ def test_patch_task_rejects_explicit_null(client, field):
     response = client.patch("/tasks/1", json={field: None})
 
     assert response.status_code == 422
-    errors = response.json()["detail"]
-    assert any(error["loc"] == ["body", field] for error in errors)
+    errors = validation_error_fields(response)
+    assert any(error["field"] == field for error in errors)
     # The rejected request must not change the task or any other task.
     assert client.get("/tasks/1").json() == before
     assert [
@@ -826,7 +841,7 @@ def test_patch_task_with_empty_body_is_a_noop(client):
     [
         {"title": ""},
         {"title": "   "},
-        {"title": "x" * 101},
+        {"title": "x" * 121},
         {"title": 123},
         {"completed": "definitely-not-a-boolean"},
     ],
@@ -841,8 +856,8 @@ def test_patch_task_rejects_invalid_values_without_changing_data(client, payload
 
     assert response.status_code == 422
     assert any(
-        error["loc"] == ["body", field]
-        for error in response.json()["detail"]
+        error["field"] == field
+        for error in validation_error_fields(response)
     )
     assert client.get("/tasks/1").json() == before
     assert [
@@ -920,7 +935,7 @@ def test_duplicate_post_creates_two_separate_tasks(client):
 
 @pytest.mark.parametrize(
     "title",
-    ["", "x" * 101],
+    ["", "x" * 121],
     ids=["empty", "too-long"],
 )
 def test_database_rejects_invalid_title(session_factory, user_id, title):

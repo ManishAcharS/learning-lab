@@ -35,7 +35,9 @@ from database import DATABASE_PATH
 NEW_TASKS_TABLE = """
 CREATE TABLE tasks_new (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    title TEXT NOT NULL CHECK(length(title) BETWEEN 1 AND 100),
+    title TEXT NOT NULL CHECK(length(title) BETWEEN 1 AND 120),
+    description TEXT,
+    due_date DATE,
     completed INTEGER NOT NULL DEFAULT 0
         CHECK(completed IN (0, 1)),
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,

@@ -1,12 +1,21 @@
 import logging
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import date, datetime
+from enum import Enum
 from typing import Annotated, Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.security import OAuth2PasswordRequestForm
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    EmailStr,
+    Field,
+    field_validator,
+    model_validator,
+)
 from slowapi.errors import RateLimitExceeded
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
@@ -33,6 +42,57 @@ app = FastAPI(title="Taskflow API", lifespan=lifespan)
 # handler for RateLimitExceeded. Only decorated routes consume the limit.
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, rate_limit_exceeded_handler)
+
+VALIDATION_ERROR_CODE = "validation_error"
+VALIDATION_LOCATION_PREFIXES = {"body", "query", "path", "header", "cookie"}
+
+
+def format_validation_field(location: tuple[object, ...]) -> str:
+    """Turn a Pydantic error location into a stable public field path."""
+    parts = [
+        part for part in location if part not in VALIDATION_LOCATION_PREFIXES
+    ]
+    if not parts:
+        return "request"
+
+    field = ""
+    for part in parts:
+        if isinstance(part, int):
+            field += f"[{part}]"
+        else:
+            field = f"{field}.{part}" if field else str(part)
+    return field
+
+
+def readable_validation_message(error: dict) -> str:
+    """Use Pydantic's message text without exposing inputs or exception objects."""
+    message = str(error.get("msg", "Invalid value"))
+    # Pydantic prefixes custom validator failures with this internal wording.
+    if message.startswith("Value error, "):
+        message = message[len("Value error, "):]
+    return message
+
+
+@app.exception_handler(RequestValidationError)
+async def handle_request_validation_error(
+    request: Request,
+    exc: RequestValidationError,
+):
+    """Return one consistent 422 shape for every endpoint's validation errors."""
+    fields = [
+        {
+            "field": format_validation_field(tuple(error.get("loc", ()))),
+            "message": readable_validation_message(error),
+        }
+        for error in exc.errors()
+    ]
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+        content={
+            "error": VALIDATION_ERROR_CODE,
+            "fields": fields,
+        },
+    )
 
 DbSession = Annotated[Session, Depends(get_db)]
 CurrentUser = Annotated[User, Depends(get_current_active_user)]
@@ -195,8 +255,32 @@ def get_me(current_user: Annotated[User, Depends(get_current_active_user)]):
     return current_user
 
 
+class TaskStatus(str, Enum):
+    """Task states supported by the existing binary ``completed`` field."""
+
+    PENDING = "pending"
+    COMPLETED = "completed"
+
+
+TITLE_MAX_LENGTH = 120
+DESCRIPTION_MAX_LENGTH = 2000
+
+
+def validate_due_date(value: date | None) -> date | None:
+    """Reject due dates before the server's current local date."""
+    if value is not None and value < date.today():
+        raise ValueError("due_date must be today or later")
+    return value
+
+
 class TaskCreate(BaseModel):
-    title: str = Field(min_length=1, max_length=100)
+    title: str = Field(min_length=1, max_length=TITLE_MAX_LENGTH)
+    description: str | None = Field(
+        default=None,
+        max_length=DESCRIPTION_MAX_LENGTH,
+    )
+    status: TaskStatus = TaskStatus.PENDING
+    due_date: date | None = None
     completed: bool = False
 
     @field_validator("title")
@@ -206,9 +290,37 @@ class TaskCreate(BaseModel):
             raise ValueError("title must not be empty or whitespace-only")
         return value
 
+    @field_validator("due_date")
+    @classmethod
+    def validate_create_due_date(cls, value: date | None) -> date | None:
+        return validate_due_date(value)
+
+    @model_validator(mode="after")
+    def reconcile_status_and_completed(self):
+        """Keep the API status and the persisted boolean consistent."""
+        if "status" in self.model_fields_set:
+            expected_completed = self.status is TaskStatus.COMPLETED
+            if (
+                "completed" in self.model_fields_set
+                and self.completed != expected_completed
+            ):
+                raise ValueError("completed must match status")
+            self.completed = expected_completed
+        return self
+
 
 class TaskUpdate(BaseModel):
-    title: str | None = Field(default=None, min_length=1, max_length=100)
+    title: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=TITLE_MAX_LENGTH,
+    )
+    description: str | None = Field(
+        default=None,
+        max_length=DESCRIPTION_MAX_LENGTH,
+    )
+    status: TaskStatus | None = None
+    due_date: date | None = None
     completed: bool | None = None
 
     @field_validator("title")
@@ -222,12 +334,34 @@ class TaskUpdate(BaseModel):
             raise ValueError("title must not be empty or whitespace-only")
         return value
 
+    @field_validator("status")
+    @classmethod
+    def reject_explicit_null_status(cls, value):
+        if value is None:
+            raise ValueError("must not be null; omit the field to leave it unchanged")
+        return value
+
+    @field_validator("due_date")
+    @classmethod
+    def validate_update_due_date(cls, value: date | None) -> date | None:
+        return validate_due_date(value)
+
     @field_validator("completed")
     @classmethod
     def reject_explicit_null(cls, value):
         if value is None:
             raise ValueError("must not be null; omit the field to leave it unchanged")
         return value
+
+    @model_validator(mode="after")
+    def reconcile_status_and_completed(self):
+        if (
+            "status" in self.model_fields_set
+            and "completed" in self.model_fields_set
+            and self.completed != (self.status is TaskStatus.COMPLETED)
+        ):
+            raise ValueError("completed must match status")
+        return self
 
 
 class TaskRead(BaseModel):
@@ -237,7 +371,10 @@ class TaskRead(BaseModel):
 
     id: int
     title: str
+    description: str | None
+    status: TaskStatus
     completed: bool
+    due_date: date | None
     created_at: datetime
 
 
@@ -335,7 +472,9 @@ def create_task(task: TaskCreate, db: DbSession, current_user: CurrentUser):
     # Ownership always comes from the verified token, never the request body.
     new_task = Task(
         title=task.title,
+        description=task.description,
         completed=task.completed,
+        due_date=task.due_date,
         user_id=current_user.id,
     )
     db.add(new_task)
@@ -359,8 +498,11 @@ def update_task(
     task = get_owned_task(db, task_id, current_user)
 
     # Keep omitted fields unchanged during a partial update. TaskUpdate only
-    # exposes title/completed, so user_id can never be changed by a request.
+    # exposes task-owned fields, so user_id can never be changed by a request.
     changes = update.model_dump(exclude_unset=True)
+    status_value = changes.pop("status", None)
+    if status_value is not None:
+        changes["completed"] = status_value is TaskStatus.COMPLETED
     for field, value in changes.items():
         setattr(task, field, value)
 
