@@ -1,6 +1,6 @@
 import logging
 from contextlib import asynccontextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from enum import Enum
 from typing import Annotated, Literal
 
@@ -378,14 +378,22 @@ class TaskRead(BaseModel):
     created_at: datetime
 
 
-def get_owned_task(db: Session, task_id: int, current_user: User) -> Task:
+def get_owned_task(
+    db: Session,
+    task_id: int,
+    current_user: User,
+    *,
+    include_deleted: bool = False,
+) -> Task:
     """Return a task only when it belongs to ``current_user``.
 
     A missing task keeps the existing 404 behavior. An existing task owned by
     someone else returns 403 without exposing its contents or owner details.
+    Soft-deleted tasks are treated as missing unless ``include_deleted`` is set,
+    which restore uses so it can find the owner's deleted task.
     """
     task = db.get(Task, task_id)
-    if task is None:
+    if task is None or (task.deleted_at is not None and not include_deleted):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Task not found",
@@ -431,7 +439,11 @@ def get_tasks(
 ):
     # Ownership is part of every query, including the count, so users can never
     # observe another user's tasks through listing, search, or pagination.
-    filters = [Task.user_id == current_user.id]
+    # Soft-deleted tasks are excluded before every other filter is applied.
+    filters = [
+        Task.user_id == current_user.id,
+        Task.deleted_at.is_(None),
+    ]
 
     # Filter in SQL; False must still apply, so compare explicitly to None.
     if completed is not None:
@@ -513,6 +525,28 @@ def update_task(
 
 @app.delete("/tasks/{task_id}", status_code=204)
 def delete_task(task_id: int, db: DbSession, current_user: CurrentUser):
+    """Soft-delete an owned, active task.
+
+    The row is kept and ``deleted_at`` records when it was removed from the
+    active set. A repeated delete finds no active task and keeps the original
+    404 response, so the first deletion timestamp is never overwritten.
+    """
     task = get_owned_task(db, task_id, current_user)
-    db.delete(task)
+    task.deleted_at = datetime.now(timezone.utc)
     commit_changes(db)
+
+
+@app.post("/tasks/{task_id}/restore", response_model=TaskRead)
+def restore_task(task_id: int, db: DbSession, current_user: CurrentUser):
+    """Restore an owned, soft-deleted task by clearing ``deleted_at``.
+
+    Restore is idempotent: restoring a task that is already active returns it
+    unchanged. A task owned by another user follows the existing 403 ownership
+    response, while a task that never existed returns 404.
+    """
+    task = get_owned_task(db, task_id, current_user, include_deleted=True)
+    if task.deleted_at is not None:
+        task.deleted_at = None
+        commit_changes(db)
+        db.refresh(task)
+    return task

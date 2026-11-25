@@ -1,0 +1,24 @@
+TaskFlow database migrations
+============================
+
+Alembic was introduced after the project already had a schema, so revision
+``0001_initial_schema`` is a baseline of the pre-soft-delete tables and
+``0002_add_task_deleted_at`` adds the new nullable column.
+
+Normal upgrade:
+
+    alembic upgrade head
+
+By default ``alembic/env.py`` uses the same database URL as ``database.py``.
+To run migrations against a disposable database, set ``TASKFLOW_DATABASE_URL``:
+
+    TASKFLOW_DATABASE_URL=sqlite:///path/to/test.db alembic upgrade head
+
+An existing database that already has the baseline tables (but no
+``alembic_version`` table) should be adopted once with:
+
+    alembic stamp 0001_initial_schema
+    alembic upgrade head
+
+Do not stamp a legacy database that predates the current schema without first
+running the ownership migration in ``migrate_task_ownership.py``.
