@@ -12,7 +12,7 @@ from sqlalchemy import engine_from_config, pool
 
 from alembic import context
 from database import DATABASE_URL, Base
-from models import Task, User  # noqa: F401  (register tables on Base.metadata)
+from models import Comment, Task, User  # noqa: F401  (register tables on Base.metadata)
 
 config = context.config
 

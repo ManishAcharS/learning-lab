@@ -3,7 +3,7 @@
 from collections.abc import Generator
 from pathlib import Path
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -21,6 +21,20 @@ engine = create_engine(
     DATABASE_URL,
     connect_args={"check_same_thread": False},
 )
+
+
+@event.listens_for(engine, "connect")
+def _enable_sqlite_foreign_keys(dbapi_connection, connection_record) -> None:
+    """Make SQLite enforce foreign keys, including ON DELETE CASCADE.
+
+    SQLite disables foreign-key enforcement per connection by default, so
+    without this pragma the database-level cascades declared by the models and
+    migrations would not run.
+    """
+    cursor = dbapi_connection.cursor()
+    cursor.execute("PRAGMA foreign_keys=ON")
+    cursor.close()
+
 
 SessionLocal = sessionmaker(
     bind=engine,
@@ -49,6 +63,6 @@ def init_db() -> None:
     columns on an existing table, so real schema changes need a migration.
     """
     # Import models so their tables are registered on Base.metadata.
-    from models import Task, User  # noqa: F401
+    from models import Comment, Task, User  # noqa: F401
 
     Base.metadata.create_all(bind=engine)

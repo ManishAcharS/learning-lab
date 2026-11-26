@@ -47,6 +47,11 @@ class Task(Base):
     )
 
     user: Mapped["User"] = relationship(back_populates="tasks")
+    comments: Mapped[list["Comment"]] = relationship(
+        back_populates="task",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
 
     @property
     def status(self) -> str:
@@ -75,4 +80,43 @@ class User(Base):
         back_populates="user",
         cascade="all, delete-orphan",
     )
+    comments: Mapped[list["Comment"]] = relationship(
+        back_populates="author",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+
+class Comment(Base):
+    """A comment on a task, written by one authenticated user."""
+
+    __tablename__ = "comments"
+    __table_args__ = (
+        CheckConstraint(
+            "length(body) BETWEEN 1 AND 2000",
+            name="ck_comments_body_length",
+        ),
+        {"sqlite_autoincrement": True},
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    task_id: Mapped[int] = mapped_column(
+        ForeignKey("tasks.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    author_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    body: Mapped[str] = mapped_column(String(2000), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+    task: Mapped[Task] = relationship(back_populates="comments")
+    author: Mapped[User] = relationship(back_populates="comments")
 

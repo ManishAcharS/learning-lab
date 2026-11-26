@@ -23,7 +23,7 @@ from sqlalchemy.orm import Session
 
 from database import get_db, init_db
 from deps import get_current_active_user, get_jwt_secret
-from models import Task, User
+from models import Comment, Task, User
 from rate_limit import limiter, rate_limit_exceeded_handler
 from security import create_access_token, hash_password, verify_password
 
@@ -49,9 +49,11 @@ VALIDATION_LOCATION_PREFIXES = {"body", "query", "path", "header", "cookie"}
 
 def format_validation_field(location: tuple[object, ...]) -> str:
     """Turn a Pydantic error location into a stable public field path."""
-    parts = [
-        part for part in location if part not in VALIDATION_LOCATION_PREFIXES
-    ]
+    # Strip only FastAPI's leading request location (body/query/path/...), so a
+    # real field that happens to be named like one of those keeps its name.
+    parts = list(location)
+    if parts and parts[0] in VALIDATION_LOCATION_PREFIXES:
+        parts = parts[1:]
     if not parts:
         return "request"
 
@@ -378,6 +380,34 @@ class TaskRead(BaseModel):
     created_at: datetime
 
 
+COMMENT_BODY_MAX_LENGTH = 2000
+
+
+class CommentCreate(BaseModel):
+    """Comment input; ownership and the parent task come from auth and the URL."""
+
+    body: str = Field(min_length=1, max_length=COMMENT_BODY_MAX_LENGTH)
+
+    @field_validator("body")
+    @classmethod
+    def reject_blank_body(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("body must not be empty or whitespace-only")
+        return value
+
+
+class CommentRead(BaseModel):
+    """Safe public representation of a comment."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    task_id: int
+    author_id: int
+    body: str
+    created_at: datetime
+
+
 def get_owned_task(
     db: Session,
     task_id: int,
@@ -550,3 +580,61 @@ def restore_task(task_id: int, db: DbSession, current_user: CurrentUser):
         commit_changes(db)
         db.refresh(task)
     return task
+
+
+@app.post(
+    "/tasks/{task_id}/comments",
+    response_model=CommentRead,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_comment(
+    task_id: int,
+    comment: CommentCreate,
+    db: DbSession,
+    current_user: CurrentUser,
+):
+    """Add a comment to an active task owned by the authenticated user."""
+    # Reuse task access control: missing/deleted tasks are 404, other owners 403.
+    task = get_owned_task(db, task_id, current_user)
+
+    new_comment = Comment(
+        task_id=task.id,
+        author_id=current_user.id,
+        body=comment.body,
+    )
+    db.add(new_comment)
+    commit_changes(db)
+    db.refresh(new_comment)
+    return new_comment
+
+
+@app.get("/tasks/{task_id}/comments", response_model=list[CommentRead])
+def get_task_comments(
+    task_id: int,
+    db: DbSession,
+    current_user: CurrentUser,
+    response: Response,
+    limit: Annotated[int, Query(ge=1, le=MAX_PAGE_LIMIT)] = DEFAULT_PAGE_LIMIT,
+    offset: Annotated[int, Query(ge=0)] = 0,
+):
+    """List an active task's comments, newest first, using offset pagination."""
+    task = get_owned_task(db, task_id, current_user)
+
+    filters = [Comment.task_id == task.id]
+    total = db.scalar(
+        select(func.count()).select_from(Comment).where(*filters)
+    ) or 0
+
+    statement = (
+        select(Comment)
+        .where(*filters)
+        .order_by(Comment.created_at.desc(), Comment.id.desc())
+        .offset(offset)
+        .limit(limit)
+    )
+    comments = db.scalars(statement).all()
+
+    response.headers["X-Total-Count"] = str(total)
+    response.headers["X-Limit"] = str(limit)
+    response.headers["X-Offset"] = str(offset)
+    return comments
