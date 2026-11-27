@@ -17,7 +17,7 @@ from pydantic import (
     model_validator,
 )
 from slowapi.errors import RateLimitExceeded
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -131,10 +131,37 @@ def commit_changes(db: Session) -> None:
 
 
 @app.get("/health")
-def health():
+def health(db: DbSession):
+    """Report API liveness and database readiness.
+
+    The query is deliberately tiny and unauthenticated. Failures return a
+    generic 503 body: no exception text, connection string, or credentials are
+    ever included in the response.
+    """
+    try:
+        db.execute(text("SELECT 1"))
+    except SQLAlchemyError:
+        logger.exception("Health check database query failed")
+        # End the failed transaction so nothing is reused by a later request.
+        # A broken connection can also make rollback fail; the health response
+        # must still be a generic 503 rather than a 500.
+        try:
+            db.rollback()
+        except SQLAlchemyError:
+            logger.exception("Health check rollback failed")
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={
+                "status": "unhealthy",
+                "message": "TaskFlow api is running",
+                "database": "unavailable",
+            },
+        )
+
     return {
         "status": "healthy",
-        "message": "TaskFlow api is running"
+        "message": "TaskFlow api is running",
+        "database": "connected",
     }
 
 

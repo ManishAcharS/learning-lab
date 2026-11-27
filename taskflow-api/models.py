@@ -28,7 +28,9 @@ class Task(Base):
         Boolean,
         nullable=False,
         default=False,
-        server_default=text("0"),
+        # ``false`` is a valid boolean literal in both SQLite and PostgreSQL;
+        # ``0`` is rejected by PostgreSQL for a BOOLEAN column.
+        server_default=text("false"),
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime,

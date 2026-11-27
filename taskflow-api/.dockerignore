@@ -1,0 +1,52 @@
+# Git internals and local metadata
+.git
+.gitignore
+.gitattributes
+
+# Secrets and local environment files
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+
+# Local databases and SQLite side files
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+*.db-wal
+*.db-shm
+*.db.bak-*
+
+# Virtual environments and Python caches
+.venv
+venv
+env
+ENV
+__pycache__
+*.py[cod]
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# Tests, coverage, and local tooling (not required at runtime)
+test_*.py
+conftest.py
+.conftest.py
+.coverage
+.coverage.*
+htmlcov
+docs
+.git-*
+*.log
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.idea
+.vscode

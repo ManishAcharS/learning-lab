@@ -140,13 +140,14 @@ def client(session_factory, user_id):
 
 
 def test_health_returns_200(client):
-    """The health endpoint should be reachable and report a healthy status."""
+    """The health endpoint should report the isolated database is reachable."""
     response = client.get("/health")
 
     assert response.status_code == 200
     assert response.json() == {
         "status": "healthy",
         "message": "TaskFlow api is running",
+        "database": "connected",
     }
 
 

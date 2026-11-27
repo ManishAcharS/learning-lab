@@ -49,7 +49,9 @@ def upgrade() -> None:
         sa.Column(
             "completed",
             sa.Boolean(),
-            server_default=sa.text("0"),
+            # ``false`` works on SQLite and PostgreSQL; PostgreSQL rejects
+            # an integer default for a BOOLEAN column.
+            server_default=sa.text("false"),
             nullable=False,
         ),
         sa.Column(
