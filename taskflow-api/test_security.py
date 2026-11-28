@@ -201,3 +201,37 @@ def test_invalid_password_input_raises_value_error(invalid_password):
     with pytest.raises(ValueError, match="password must be a non-empty string"):
         hash_password(invalid_password)
 
+
+@pytest.mark.parametrize("invalid_secret", ["", "   ", b"", b"   ", None, 12345])
+def test_create_access_token_rejects_missing_or_invalid_secret(invalid_secret):
+    """Signing must fail closed instead of using an empty or non-text key."""
+    with pytest.raises(ValueError, match="secret_key"):
+        create_access_token(TEST_SUBJECT, invalid_secret)
+
+
+@pytest.mark.parametrize("invalid_secret", ["", "   ", b"", b"   ", None, 12345])
+def test_decode_access_token_rejects_missing_or_invalid_secret(invalid_secret):
+    """Verification must fail closed for an unusable signing key."""
+    token = create_access_token(TEST_SUBJECT, TEST_SECRET)
+
+    with pytest.raises(ValueError, match="secret_key"):
+        decode_access_token(token, invalid_secret)
+
+
+@pytest.mark.parametrize("invalid_expiration", ["5m", 300, 0, object()])
+def test_create_access_token_rejects_invalid_expiration(invalid_expiration):
+    """Only timedelta lifetimes are accepted."""
+    with pytest.raises(ValueError, match="expires_delta"):
+        create_access_token(
+            TEST_SUBJECT,
+            TEST_SECRET,
+            expires_delta=invalid_expiration,
+        )
+
+
+@pytest.mark.parametrize("invalid_token", ["", None, 12345, b"header.payload.sig"])
+def test_decode_access_token_rejects_missing_or_invalid_token(invalid_token):
+    """Non-string and empty tokens are reported as invalid rather than crashing."""
+    with pytest.raises(jwt.InvalidTokenError, match="non-empty string"):
+        decode_access_token(invalid_token, TEST_SECRET)
+

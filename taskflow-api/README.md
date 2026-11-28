@@ -1,5 +1,7 @@
 # TaskFlow API
 
+![Coverage](https://img.shields.io/badge/coverage-97%25-brightgreen)
+
 A small task-management REST API built with FastAPI, Pydantic 2, the
 SQLAlchemy 2.x ORM, and SQLite. It supports paginated, searchable, filtered
 listing, plus creating, retrieving, partially updating, and deleting tasks.
@@ -7,6 +9,8 @@ Tasks are persisted in `taskflow.db`, so they survive an application restart.
 Every task belongs to exactly one registered user, and all `/tasks` endpoints
 require a valid Bearer JWT. Users can only list, read, update, and delete their
 own tasks.
+
+See [CHANGELOG.md](CHANGELOG.md) for the v0.2.0 release history.
 
 ## Request lifecycle
 
@@ -147,17 +151,23 @@ cleanup, and lets tests replace the real database session with an isolated one.
 
 ## Endpoints
 
-All `/tasks` endpoints require a valid Bearer JWT. `/health`, registration, and
-`/auth/me` are separate; see the authentication sections below.
+All endpoints except `/health`, `/auth/register`, and `/auth/login` require a
+valid Bearer JWT.
 
 | Method | Path | Purpose | Success status |
 | --- | --- | --- | --- |
-| `GET` | `/health` | Check that the API is running and healthy. | `200` |
-| `GET` | `/tasks` | List only the authenticated user's tasks. Supports optional `completed`, `search`, `sort_by`, `sort_order`, `limit`, and `offset` query parameters; defaults to the first 20 owned tasks ordered by ID. | `200` |
-| `POST` | `/tasks` | Create a task owned by the authenticated user from a `title` and optional `completed` value. The database assigns the ID. | `201` |
-| `GET` | `/tasks/{task_id}` | Retrieve one task only if the authenticated user owns it. | `200` |
-| `PATCH` | `/tasks/{task_id}` | Partially update `title` and/or `completed` on an owned task. Omitted fields are left unchanged. | `200` |
-| `DELETE` | `/tasks/{task_id}` | Delete an owned task by ID. | `204` |
+| `GET` | `/health` | Check API liveness and database readiness with `SELECT 1`. Returns `503` when the database is unavailable. | `200` |
+| `POST` | `/auth/register` | Register a unique email with an Argon2id-hashed password. | `201` |
+| `POST` | `/auth/login` | OAuth2 password login; returns a Bearer JWT. Limited to five requests per minute per IP. | `200` |
+| `GET` | `/auth/me` | Return the authenticated user's safe public profile. | `200` |
+| `GET` | `/tasks` | List owned, non-deleted tasks with optional `completed`, `search`, `sort_by`, `sort_order`, `limit`, and `offset` parameters. | `200` |
+| `POST` | `/tasks` | Create a task owned by the authenticated user. | `201` |
+| `GET` | `/tasks/{task_id}` | Retrieve one owned, active task. | `200` |
+| `PATCH` | `/tasks/{task_id}` | Partially update owned task fields; omitted fields are unchanged. | `200` |
+| `DELETE` | `/tasks/{task_id}` | Soft-delete an owned task by setting `deleted_at`. | `204` |
+| `POST` | `/tasks/{task_id}/restore` | Restore an owned, soft-deleted task. Idempotent for active tasks. | `200` |
+| `POST` | `/tasks/{task_id}/comments` | Add a comment to an owned task. The author comes from the JWT. | `201` |
+| `GET` | `/tasks/{task_id}/comments` | List an owned task's comments, newest first, with `limit` and `offset`. | `200` |
 
 Ownership is enforced in SQL for listing and by an explicit owner comparison for
 single-resource operations. A task that exists but belongs to another user
@@ -347,8 +357,16 @@ curl -X POST http://127.0.0.1:8000/tasks \
   -d '{"title": "Duplicate request"}'
 ```
 
-Interactive API documentation is available at `/docs` (Swagger UI) and
-`/redoc` while the server is running.
+Interactive API documentation is available while the server is running:
+
+- Swagger UI: <http://127.0.0.1:8000/docs>
+- ReDoc: <http://127.0.0.1:8000/redoc>
+- Live OpenAPI schema: <http://127.0.0.1:8000/openapi.json>
+- Saved schema: [`docs/openapi.json`](docs/openapi.json)
+
+Use the **Authorize** button in Swagger UI with a token from `POST /auth/login`
+to call protected routes. The OpenAPI schema documents every implemented
+operation, including authentication requirements, response codes, and examples.
 
 ## Project structure
 
@@ -392,7 +410,19 @@ or newer.
 On macOS or Linux, activate the environment with
 `source .venv/bin/activate` instead.
 
-The suite currently contains 161 tests. Each test creates a fresh SQLite file
+### Coverage
+
+The coverage command measures the running API modules and excludes standalone
+practice/migration scripts:
+
+```powershell
+python -m pytest --cov=main --cov=database --cov=models --cov=security --cov=deps --cov=rate_limit --cov-report=term-missing
+```
+
+For an HTML report, add `--cov-report=html` and open `htmlcov/index.html`.
+The latest saved summary is in `docs/coverage-2026-11-28.txt`.
+
+The suite currently contains 304 tests. Each test creates a fresh SQLite file
 under pytest's `tmp_path`, creates the schema from the ORM metadata, and installs
 a `get_db` dependency override. Task API tests seed three known tasks owned by a
 temporary test user and authenticate with that user's signed JWT. The
@@ -453,11 +483,12 @@ On startup, missing tables are created in `taskflow.db`. Then open
 - **Authentication required; no roles or admin features.** Task routes are
   restricted to the authenticated owner. Existing tasks cannot be assigned an
   owner automatically.
-- **No migration framework.** `create_all()` only creates missing tables;
-  changing an existing schema requires the separate, explicit migration script
-  or a tool such as Alembic.
-- **SQLite only.** The project is intended for local learning and small
-  workloads, not for high-concurrency or multi-server deployment.
+- **Schema changes require Alembic.** Startup `create_all()` only creates missing
+  tables; run `alembic upgrade head` for the versioned schema changes.
+- **SQLite locally, PostgreSQL in Docker.** The default local database is
+  `taskflow.db`; Compose uses PostgreSQL with a readiness check. The project is
+  still intended for local learning and small workloads rather than
+  high-concurrency multi-server deployment.
 - **Simple substring search.** `search` uses SQL `LIKE` on `title`; there is no
   full-text index, tokenization, ranking, or multi-column search.
 - **Offset pagination only.** Large offsets still require SQLite to scan the

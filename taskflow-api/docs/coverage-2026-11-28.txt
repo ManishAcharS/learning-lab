@@ -1,0 +1,89 @@
+TaskFlow API - Coverage Report
+Date: 2026-11-28
+Project: taskflow-api (flat module layout)
+
+COMMAND
+-------
+python -m pytest -q --cov=main --cov=database --cov=models --cov=security --cov=deps --cov=rate_limit --cov-report=term-missing --cov-report=json:<temp>/taskflow-coverage-final.json
+
+SOURCE SCOPE
+------------
+Application modules measured: main.py, database.py, models.py, security.py, deps.py, rate_limit.py.
+Standalone learning/migration scripts (database_practice.py, sql_practice.py, migrate_task_ownership.py) are not part of the running API and are intentionally outside this coverage scope.
+
+BASELINE (before new tests)
+---------------------------
+276 tests passed.
+Total: 93%
+
+Name            Stmts   Miss  Cover   Missing
+---------------------------------------------
+database.py        35     15    57%   37, 52-57, 69-77, 87-89
+deps.py            39      0   100%
+main.py           296     14    95%   35-36, 58, 63, 215-224, 336, 370, 392
+models.py          39      0   100%
+rate_limit.py      15      1    93%   52
+security.py        45      3    93%   30, 65, 102
+---------------------------------------------
+TOTAL             469     33    93%
+
+Modules below 80% at baseline: database.py (57%).
+
+FOCUSED TESTS ADDED
+-------------------
+test_database.py (new):
+- SQLite engine creation and real SELECT 1 execution.
+- pool_pre_ping branch for non-SQLite engine URLs (driver mocked).
+- SQLite foreign-key pragma listener and PostgreSQL no-op branch.
+- get_db success path closes the session without rollback.
+- get_db failure path rolls back, re-raises, and still closes.
+- init_db calls create_all against the configured engine.
+
+test_security.py (extended):
+- Blank/missing/non-text signing keys are rejected for create and decode.
+- Non-timedelta expiration values are rejected.
+- Empty and non-string tokens raise jwt.InvalidTokenError.
+
+test_rate_limit.py (extended):
+- Fallback Retry-After: 60 header when request state has no rate-limit window.
+
+FINAL RESULT
+------------
+304 tests passed, 2 warnings.
+
+Name            Stmts   Miss  Cover   Missing
+---------------------------------------------
+database.py        35      0   100%
+deps.py            39      0   100%
+main.py           296     14    95%   35-36, 58, 63, 215-224, 336, 370, 392
+models.py          39      0   100%
+rate_limit.py      15      0   100%
+security.py        45      0   100%
+---------------------------------------------
+TOTAL             469     14    97%
+
+MODULES BELOW 80% AFTER CHANGES
+-------------------------------
+None.
+
+Remaining uncovered lines are defensive/error branches in main.py:
+- 35-36: application lifespan startup (init_db), not run by isolated TestClients.
+- 58 and 63: empty validation-location fallback and integer field path branch.
+- 215-224: registration commit failure branches (IntegrityError and SQLAlchemyError).
+- 336: TaskCreate conflict between status and completed.
+- 370: TaskUpdate explicit null status rejection.
+- 392: TaskUpdate conflict between status and completed.
+main.py still reports 95%, above the 80% threshold.
+
+WARNINGS
+--------
+1. StarletteDeprecationWarning: httpx with starlette.testclient is deprecated; install httpx2 instead.
+2. DeprecationWarning: asyncio.iscoroutinefunction is deprecated in slowapi.
+These are dependency warnings, not test failures.
+
+NOTES
+-----
+- No application behavior was changed for coverage.
+- Existing tests and assertions were not weakened or removed.
+- The real development database (taskflow.db) was not modified.
+- No secrets or generated coverage/database artifacts are part of this change.

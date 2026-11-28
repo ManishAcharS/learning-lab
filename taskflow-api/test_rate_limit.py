@@ -5,8 +5,12 @@ The autouse limiter-reset fixture in ``conftest.py`` isolates in-memory counters
 between tests, so these tests never sleep or depend on execution order.
 """
 
+import json
+from types import SimpleNamespace
+
 import pytest
 from fastapi.testclient import TestClient
+from slowapi.errors import RateLimitExceeded
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -14,6 +18,7 @@ import main
 from database import Base, get_db
 from deps import JWT_SECRET_ENV_VAR
 from models import User
+from rate_limit import RATE_LIMIT_ERROR_DETAIL, rate_limit_exceeded_handler
 from security import hash_password
 
 # Test-only signing key. Production code reads TASKFLOW_JWT_SECRET.
@@ -241,3 +246,16 @@ def test_unrelated_endpoints_are_not_rate_limited(client_factory):
     responses = [client.get("/health") for _ in range(10)]
 
     assert [response.status_code for response in responses] == [200] * 10
+
+
+def test_handler_sets_retry_after_fallback_without_limit_state():
+    """A missing limit on request.state still yields a usable Retry-After."""
+    request = SimpleNamespace(state=SimpleNamespace())
+    limit = SimpleNamespace(error_message=None, limit="5 per 1 minute")
+    exc = RateLimitExceeded(limit)
+
+    response = rate_limit_exceeded_handler(request, exc)
+
+    assert response.status_code == 429
+    assert response.headers["Retry-After"] == "60"
+    assert json.loads(response.body) == {"detail": RATE_LIMIT_ERROR_DETAIL}

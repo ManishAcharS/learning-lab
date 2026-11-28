@@ -1,0 +1,1761 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "TaskFlow API",
+    "description": "Task management REST API with JWT authentication, per-user task ownership, filtering, pagination, soft deletion, comments, and a database-aware health check.",
+    "version": "0.2.0"
+  },
+  "paths": {
+    "/health": {
+      "get": {
+        "tags": [
+          "Health"
+        ],
+        "summary": "Check API and database health",
+        "description": "Returns API liveness together with a lightweight `SELECT 1` database readiness check. This endpoint is unauthenticated and never returns connection strings, credentials, or exception details.",
+        "operationId": "health_health_get",
+        "responses": {
+          "200": {
+            "description": "The API and database are reachable.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The API is running but the database is unreachable.",
+            "content": {
+              "application/json": {
+                "example": {
+                  "status": "unhealthy",
+                  "message": "TaskFlow api is running",
+                  "database": "unavailable"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/auth/register": {
+      "post": {
+        "tags": [
+          "Authentication"
+        ],
+        "summary": "Register a new user",
+        "description": "Creates an account with a unique email and an Argon2id password hash. Emails are normalized to lowercase. The response never includes the password or password hash.",
+        "operationId": "register_auth_register_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UserRegister"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "The newly created public user record.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserRead"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The email is already registered.",
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "Email already registered"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Request body, query, or path validation failed.",
+            "content": {
+              "application/json": {
+                "example": {
+                  "error": "validation_error",
+                  "fields": [
+                    {
+                      "field": "title",
+                      "message": "String should have at least 1 character"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "A database operation failed; details are logged server-side.",
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "Database operation failed"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/auth/login": {
+      "post": {
+        "tags": [
+          "Authentication"
+        ],
+        "summary": "Log in and obtain an access token",
+        "description": "Authenticates an email/password pair using the OAuth2 password form. `username` carries the registered email address. Unknown emails and wrong passwords return the same generic 401 to prevent account enumeration. The endpoint is limited to five requests per minute per client IP.",
+        "operationId": "login_auth_login_post",
+        "requestBody": {
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_login_auth_login_post",
+                "properties": {
+                  "username": {
+                    "type": "string",
+                    "description": "Registered email address.",
+                    "example": "ada@example.com"
+                  },
+                  "password": {
+                    "type": "string",
+                    "format": "password",
+                    "description": "Account password.",
+                    "example": "CorrectHorseBatteryStaple!"
+                  }
+                },
+                "type": "object",
+                "required": [
+                  "username",
+                  "password"
+                ]
+              },
+              "example": {
+                "username": "ada@example.com",
+                "password": "CorrectHorseBatteryStaple!"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "A Bearer access token for the authenticated user.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Token"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "The email or password is incorrect.",
+            "headers": {
+              "WWW-Authenticate": {
+                "description": "Authentication scheme for the failed request.",
+                "schema": {
+                  "type": "string",
+                  "example": "Bearer"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "Incorrect email or password"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Request body, query, or path validation failed.",
+            "content": {
+              "application/json": {
+                "example": {
+                  "error": "validation_error",
+                  "fields": [
+                    {
+                      "field": "title",
+                      "message": "String should have at least 1 character"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "The per-IP login rate limit was exceeded.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "string",
+                  "example": "60"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "Rate limit exceeded"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Server authentication is not configured.",
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "Authentication is not configured"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/auth/me": {
+      "get": {
+        "tags": [
+          "Authentication"
+        ],
+        "summary": "Get the authenticated user's profile",
+        "description": "Returns the safe public profile associated with the Bearer token. No password material is exposed.",
+        "operationId": "get_me_auth_me_get",
+        "responses": {
+          "200": {
+            "description": "The authenticated user's public profile.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserRead"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid, expired, or user-less Bearer token.",
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "Could not validate credentials"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ]
+      }
+    },
+    "/tasks": {
+      "get": {
+        "tags": [
+          "Tasks"
+        ],
+        "summary": "List, filter, search, sort, and paginate owned tasks",
+        "description": "Returns only tasks owned by the authenticated user, excluding soft-deleted tasks. Filters, case-insensitive title search, sorting, counting, and pagination all run in the database. Pagination metadata is returned in `X-Total-Count`, `X-Limit`, and `X-Offset` headers.",
+        "operationId": "get_tasks_tasks_get",
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "completed",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter by completion state; omit for all tasks.",
+              "title": "Completed"
+            },
+            "description": "Filter by completion state; omit for all tasks."
+          },
+          {
+            "name": "search",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 100
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Case-insensitive title substring; wildcards are literal.",
+              "title": "Search"
+            },
+            "description": "Case-insensitive title substring; wildcards are literal."
+          },
+          {
+            "name": "sort_by",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "enum": [
+                "id",
+                "title",
+                "completed"
+              ],
+              "type": "string",
+              "description": "Column to sort by.",
+              "default": "id",
+              "title": "Sort By"
+            },
+            "description": "Column to sort by."
+          },
+          {
+            "name": "sort_order",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "enum": [
+                "asc",
+                "desc"
+              ],
+              "type": "string",
+              "description": "Sort direction; ties are broken by ascending ID.",
+              "default": "asc",
+              "title": "Sort Order"
+            },
+            "description": "Sort direction; ties are broken by ascending ID."
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "minimum": 1,
+              "description": "Page size (1-100).",
+              "default": 20,
+              "title": "Limit"
+            },
+            "description": "Page size (1-100)."
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Number of matching tasks to skip.",
+              "default": 0,
+              "title": "Offset"
+            },
+            "description": "Number of matching tasks to skip."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Owned tasks matching the filters and page window.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/TaskRead"
+                  },
+                  "title": "Response Get Tasks Tasks Get"
+                },
+                "example": [
+                  {
+                    "id": 42,
+                    "title": "Prepare release notes",
+                    "description": "Summarize the v0.2.0 changes.",
+                    "status": "pending",
+                    "completed": false,
+                    "due_date": "2026-12-05",
+                    "created_at": "2026-11-28T10:15:00Z"
+                  }
+                ]
+              }
+            },
+            "headers": {
+              "X-Total-Count": {
+                "description": "Filtered task count before limit/offset.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "X-Limit": {
+                "description": "Maximum tasks in this response.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "X-Offset": {
+                "description": "Number of matching tasks skipped.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid, expired, or user-less Bearer token.",
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "Could not validate credentials"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Request body, query, or path validation failed.",
+            "content": {
+              "application/json": {
+                "example": {
+                  "error": "validation_error",
+                  "fields": [
+                    {
+                      "field": "title",
+                      "message": "String should have at least 1 character"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "A database operation failed; details are logged server-side.",
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "Database operation failed"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Tasks"
+        ],
+        "summary": "Create a task",
+        "description": "Creates a task owned by the authenticated user. Ownership always comes from the verified JWT, never the request body. Status and `completed` must agree when both are supplied.",
+        "operationId": "create_task_tasks_post",
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TaskCreate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "The newly created task.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskRead"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid, expired, or user-less Bearer token.",
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "Could not validate credentials"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Request body, query, or path validation failed.",
+            "content": {
+              "application/json": {
+                "example": {
+                  "error": "validation_error",
+                  "fields": [
+                    {
+                      "field": "title",
+                      "message": "String should have at least 1 character"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "A database operation failed; details are logged server-side.",
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "Database operation failed"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/tasks/{task_id}": {
+      "get": {
+        "tags": [
+          "Tasks"
+        ],
+        "summary": "Get one owned task",
+        "description": "Returns a single active task when it belongs to the authenticated user. Soft-deleted tasks are treated as missing.",
+        "operationId": "get_task_tasks__task_id__get",
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Task Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The requested owned task.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskRead"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid, expired, or user-less Bearer token.",
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "Could not validate credentials"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The task exists but belongs to another user.",
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "Not authorized to access this task"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No active task exists with the requested ID.",
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "Task not found"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Request body, query, or path validation failed.",
+            "content": {
+              "application/json": {
+                "example": {
+                  "error": "validation_error",
+                  "fields": [
+                    {
+                      "field": "title",
+                      "message": "String should have at least 1 character"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "A database operation failed; details are logged server-side.",
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "Database operation failed"
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "Tasks"
+        ],
+        "summary": "Partially update an owned task",
+        "description": "Updates only the supplied fields on an active task owned by the authenticated user. Omitted fields are unchanged; explicit JSON null is rejected for non-nullable fields. Ownership cannot be changed.",
+        "operationId": "update_task_tasks__task_id__patch",
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Task Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TaskUpdate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The updated task.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskRead"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid, expired, or user-less Bearer token.",
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "Could not validate credentials"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The task exists but belongs to another user.",
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "Not authorized to access this task"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No active task exists with the requested ID.",
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "Task not found"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Request body, query, or path validation failed.",
+            "content": {
+              "application/json": {
+                "example": {
+                  "error": "validation_error",
+                  "fields": [
+                    {
+                      "field": "title",
+                      "message": "String should have at least 1 character"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "A database operation failed; details are logged server-side.",
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "Database operation failed"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Tasks"
+        ],
+        "summary": "Soft-delete an owned task",
+        "description": "Marks an active task owned by the authenticated user as deleted by setting `deleted_at`. The row is retained so restore is possible. Repeating the delete returns 404 and does not overwrite the timestamp.",
+        "operationId": "delete_task_tasks__task_id__delete",
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Task Id"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The task was soft-deleted; the response has no body."
+          },
+          "401": {
+            "description": "Missing, invalid, expired, or user-less Bearer token.",
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "Could not validate credentials"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The task exists but belongs to another user.",
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "Not authorized to access this task"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No active task exists with the requested ID.",
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "Task not found"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Request body, query, or path validation failed.",
+            "content": {
+              "application/json": {
+                "example": {
+                  "error": "validation_error",
+                  "fields": [
+                    {
+                      "field": "title",
+                      "message": "String should have at least 1 character"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "A database operation failed; details are logged server-side.",
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "Database operation failed"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/tasks/{task_id}/restore": {
+      "post": {
+        "tags": [
+          "Tasks"
+        ],
+        "summary": "Restore a soft-deleted owned task",
+        "description": "Clears `deleted_at` on a task owned by the authenticated user. Restore is idempotent: an already-active task is returned unchanged. Another user's task returns 403; an unknown ID returns 404.",
+        "operationId": "restore_task_tasks__task_id__restore_post",
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Task Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The restored or already-active task.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskRead"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid, expired, or user-less Bearer token.",
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "Could not validate credentials"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The task exists but belongs to another user.",
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "Not authorized to access this task"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No active task exists with the requested ID.",
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "Task not found"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Request body, query, or path validation failed.",
+            "content": {
+              "application/json": {
+                "example": {
+                  "error": "validation_error",
+                  "fields": [
+                    {
+                      "field": "title",
+                      "message": "String should have at least 1 character"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "A database operation failed; details are logged server-side.",
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "Database operation failed"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/tasks/{task_id}/comments": {
+      "post": {
+        "tags": [
+          "Comments"
+        ],
+        "summary": "Add a comment to an owned task",
+        "description": "Creates a comment on an active task owned by the authenticated user. The author always comes from the JWT; task access checks reject missing or deleted tasks with 404 and other users' tasks with 403.",
+        "operationId": "create_comment_tasks__task_id__comments_post",
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Task Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CommentCreate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "The newly created comment.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommentRead"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid, expired, or user-less Bearer token.",
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "Could not validate credentials"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The task exists but belongs to another user.",
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "Not authorized to access this task"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No active task exists with the requested ID.",
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "Task not found"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Request body, query, or path validation failed.",
+            "content": {
+              "application/json": {
+                "example": {
+                  "error": "validation_error",
+                  "fields": [
+                    {
+                      "field": "title",
+                      "message": "String should have at least 1 character"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "A database operation failed; details are logged server-side.",
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "Database operation failed"
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "tags": [
+          "Comments"
+        ],
+        "summary": "List an owned task's comments",
+        "description": "Returns comments for an active task owned by the authenticated user, newest first, with offset pagination. Pagination metadata is returned in `X-Total-Count`, `X-Limit`, and `X-Offset` headers.",
+        "operationId": "get_task_comments_tasks__task_id__comments_get",
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Task Id"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "minimum": 1,
+              "description": "Page size (1-100).",
+              "default": 20,
+              "title": "Limit"
+            },
+            "description": "Page size (1-100)."
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Number of comments to skip.",
+              "default": 0,
+              "title": "Offset"
+            },
+            "description": "Number of comments to skip."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Comments for the owned task, newest first.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/CommentRead"
+                  },
+                  "title": "Response Get Task Comments Tasks  Task Id  Comments Get"
+                },
+                "example": [
+                  {
+                    "id": 7,
+                    "task_id": 42,
+                    "author_id": 1,
+                    "body": "Confirmed on staging; looks good to ship.",
+                    "created_at": "2026-11-28T10:20:00Z"
+                  }
+                ]
+              }
+            },
+            "headers": {
+              "X-Total-Count": {
+                "description": "Total comments on the task before limit/offset.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "X-Limit": {
+                "description": "Maximum comments in this response.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "X-Offset": {
+                "description": "Number of comments skipped.",
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid, expired, or user-less Bearer token.",
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "Could not validate credentials"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The task exists but belongs to another user.",
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "Not authorized to access this task"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No active task exists with the requested ID.",
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "Task not found"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Request body, query, or path validation failed.",
+            "content": {
+              "application/json": {
+                "example": {
+                  "error": "validation_error",
+                  "fields": [
+                    {
+                      "field": "title",
+                      "message": "String should have at least 1 character"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "A database operation failed; details are logged server-side.",
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "Database operation failed"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Body_login_auth_login_post": {
+        "properties": {
+          "grant_type": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^password$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Grant Type"
+          },
+          "username": {
+            "type": "string",
+            "title": "Username"
+          },
+          "password": {
+            "type": "string",
+            "format": "password",
+            "title": "Password"
+          },
+          "scope": {
+            "type": "string",
+            "title": "Scope",
+            "default": ""
+          },
+          "client_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Client Id"
+          },
+          "client_secret": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "format": "password",
+            "title": "Client Secret"
+          }
+        },
+        "type": "object",
+        "required": [
+          "username",
+          "password"
+        ],
+        "title": "Body_login_auth_login_post"
+      },
+      "CommentCreate": {
+        "properties": {
+          "body": {
+            "type": "string",
+            "maxLength": 2000,
+            "minLength": 1,
+            "title": "Body",
+            "description": "Comment text, 1-2,000 characters and not whitespace-only.",
+            "examples": [
+              "Confirmed on staging; looks good to ship."
+            ]
+          }
+        },
+        "type": "object",
+        "required": [
+          "body"
+        ],
+        "title": "CommentCreate",
+        "description": "Comment input; ownership and the parent task come from auth and the URL.",
+        "example": {
+          "body": "Confirmed on staging; looks good to ship."
+        }
+      },
+      "CommentRead": {
+        "properties": {
+          "id": {
+            "type": "integer",
+            "title": "Id",
+            "description": "Stable comment ID.",
+            "examples": [
+              7
+            ]
+          },
+          "task_id": {
+            "type": "integer",
+            "title": "Task Id",
+            "description": "Parent task ID.",
+            "examples": [
+              42
+            ]
+          },
+          "author_id": {
+            "type": "integer",
+            "title": "Author Id",
+            "description": "Author user ID.",
+            "examples": [
+              1
+            ]
+          },
+          "body": {
+            "type": "string",
+            "title": "Body",
+            "description": "Comment text.",
+            "examples": [
+              "Confirmed on staging; looks good to ship."
+            ]
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At",
+            "description": "Database-generated creation timestamp.",
+            "examples": [
+              "2026-11-28T10:20:00Z"
+            ]
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "task_id",
+          "author_id",
+          "body",
+          "created_at"
+        ],
+        "title": "CommentRead",
+        "description": "Safe public representation of a comment.",
+        "example": {
+          "author_id": 1,
+          "body": "Confirmed on staging; looks good to ship.",
+          "created_at": "2026-11-28T10:20:00Z",
+          "id": 7,
+          "task_id": 42
+        }
+      },
+      "HealthResponse": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "healthy",
+              "unhealthy"
+            ],
+            "title": "Status",
+            "description": "Overall API health.",
+            "examples": [
+              "healthy"
+            ]
+          },
+          "message": {
+            "type": "string",
+            "title": "Message",
+            "description": "Human-readable status message.",
+            "examples": [
+              "TaskFlow api is running"
+            ]
+          },
+          "database": {
+            "type": "string",
+            "enum": [
+              "connected",
+              "unavailable"
+            ],
+            "title": "Database",
+            "description": "Result of the lightweight database connectivity check.",
+            "examples": [
+              "connected"
+            ]
+          }
+        },
+        "type": "object",
+        "required": [
+          "status",
+          "message",
+          "database"
+        ],
+        "title": "HealthResponse",
+        "description": "Safe health payload; never includes connection details.",
+        "example": {
+          "database": "connected",
+          "message": "TaskFlow api is running",
+          "status": "healthy"
+        }
+      },
+      "TaskCreate": {
+        "properties": {
+          "title": {
+            "type": "string",
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Title",
+            "description": "Task title, 1-120 characters and not whitespace-only.",
+            "examples": [
+              "Prepare release notes"
+            ]
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 2000
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description",
+            "description": "Optional details up to 2,000 characters.",
+            "examples": [
+              "Summarize the v0.2.0 changes."
+            ]
+          },
+          "status": {
+            "$ref": "#/components/schemas/TaskStatus",
+            "description": "API status; kept consistent with `completed`.",
+            "default": "pending",
+            "examples": [
+              "pending"
+            ]
+          },
+          "due_date": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Due Date",
+            "description": "Optional due date; must be today or later.",
+            "examples": [
+              "2026-12-05"
+            ]
+          },
+          "completed": {
+            "type": "boolean",
+            "title": "Completed",
+            "description": "Completion flag; must agree with `status` when both are sent.",
+            "default": false,
+            "examples": [
+              false
+            ]
+          }
+        },
+        "type": "object",
+        "required": [
+          "title"
+        ],
+        "title": "TaskCreate",
+        "example": {
+          "completed": false,
+          "description": "Summarize the v0.2.0 changes.",
+          "due_date": "2026-12-05",
+          "status": "pending",
+          "title": "Prepare release notes"
+        }
+      },
+      "TaskRead": {
+        "properties": {
+          "id": {
+            "type": "integer",
+            "title": "Id",
+            "description": "Stable task ID.",
+            "examples": [
+              42
+            ]
+          },
+          "title": {
+            "type": "string",
+            "title": "Title",
+            "description": "Task title.",
+            "examples": [
+              "Prepare release notes"
+            ]
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description",
+            "description": "Optional task details.",
+            "examples": [
+              "Summarize the v0.2.0 changes."
+            ]
+          },
+          "status": {
+            "$ref": "#/components/schemas/TaskStatus",
+            "description": "Derived API status.",
+            "examples": [
+              "pending"
+            ]
+          },
+          "completed": {
+            "type": "boolean",
+            "title": "Completed",
+            "description": "Persisted completion flag.",
+            "examples": [
+              false
+            ]
+          },
+          "due_date": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Due Date",
+            "description": "Optional due date.",
+            "examples": [
+              "2026-12-05"
+            ]
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At",
+            "description": "Database-generated creation timestamp.",
+            "examples": [
+              "2026-11-28T10:15:00Z"
+            ]
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "title",
+          "description",
+          "status",
+          "completed",
+          "due_date",
+          "created_at"
+        ],
+        "title": "TaskRead",
+        "description": "Response shape for a task, including its database-generated timestamp.",
+        "example": {
+          "completed": false,
+          "created_at": "2026-11-28T10:15:00Z",
+          "description": "Summarize the v0.2.0 changes.",
+          "due_date": "2026-12-05",
+          "id": 42,
+          "status": "pending",
+          "title": "Prepare release notes"
+        }
+      },
+      "TaskStatus": {
+        "type": "string",
+        "enum": [
+          "pending",
+          "completed"
+        ],
+        "title": "TaskStatus",
+        "description": "Task states supported by the existing binary ``completed`` field."
+      },
+      "TaskUpdate": {
+        "properties": {
+          "title": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 120,
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title",
+            "description": "New title; omit to leave unchanged. Explicit null is rejected.",
+            "examples": [
+              "Prepare v0.2.0 release notes"
+            ]
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 2000
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description",
+            "description": "New details; omit to leave unchanged.",
+            "examples": [
+              "Updated release checklist."
+            ]
+          },
+          "status": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TaskStatus"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "New API status; omit to leave unchanged. Explicit null is rejected.",
+            "examples": [
+              "completed"
+            ]
+          },
+          "due_date": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Due Date",
+            "description": "New due date; must be today or later when provided.",
+            "examples": [
+              "2026-12-10"
+            ]
+          },
+          "completed": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Completed",
+            "description": "New completion flag; omit to leave unchanged.",
+            "examples": [
+              true
+            ]
+          }
+        },
+        "type": "object",
+        "title": "TaskUpdate",
+        "example": {
+          "completed": true,
+          "status": "completed",
+          "title": "Prepare v0.2.0 release notes"
+        }
+      },
+      "Token": {
+        "properties": {
+          "access_token": {
+            "type": "string",
+            "title": "Access Token",
+            "description": "Signed HS256 JWT access token.",
+            "examples": [
+              "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+            ]
+          },
+          "token_type": {
+            "type": "string",
+            "title": "Token Type",
+            "description": "OAuth2 token type.",
+            "default": "bearer",
+            "examples": [
+              "bearer"
+            ]
+          }
+        },
+        "type": "object",
+        "required": [
+          "access_token"
+        ],
+        "title": "Token",
+        "description": "OAuth2-compatible access-token response; contains no user secrets."
+      },
+      "UserRead": {
+        "properties": {
+          "id": {
+            "type": "integer",
+            "title": "Id",
+            "description": "Stable numeric user ID.",
+            "examples": [
+              1
+            ]
+          },
+          "email": {
+            "type": "string",
+            "format": "email",
+            "title": "Email",
+            "description": "Account email address.",
+            "examples": [
+              "ada@example.com"
+            ]
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At",
+            "description": "Account creation timestamp.",
+            "examples": [
+              "2026-11-28T10:15:00Z"
+            ]
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "email",
+          "created_at"
+        ],
+        "title": "UserRead",
+        "description": "Safe public user representation excluding secrets.",
+        "example": {
+          "created_at": "2026-11-28T10:15:00Z",
+          "email": "ada@example.com",
+          "id": 1
+        }
+      },
+      "UserRegister": {
+        "properties": {
+          "email": {
+            "type": "string",
+            "format": "email",
+            "title": "Email",
+            "description": "Account email; stored lowercased and trimmed.",
+            "examples": [
+              "ada@example.com"
+            ]
+          },
+          "password": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 8,
+            "title": "Password",
+            "description": "Plaintext password (8-128 characters), hashed with Argon2id.",
+            "examples": [
+              "CorrectHorseBatteryStaple!"
+            ]
+          }
+        },
+        "type": "object",
+        "required": [
+          "email",
+          "password"
+        ],
+        "title": "UserRegister"
+      }
+    },
+    "securitySchemes": {
+      "OAuth2PasswordBearer": {
+        "type": "oauth2",
+        "flows": {
+          "password": {
+            "scopes": {},
+            "tokenUrl": "/auth/login"
+          }
+        }
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "Health",
+      "description": "Unauthenticated API liveness and database readiness."
+    },
+    {
+      "name": "Authentication",
+      "description": "Registration, login, and the authenticated profile."
+    },
+    {
+      "name": "Tasks",
+      "description": "Authenticated task CRUD, filtering, pagination, and soft-delete restore. Ownership is taken from the JWT and every query is scoped to the current user."
+    },
+    {
+      "name": "Comments",
+      "description": "Authenticated comments on active tasks owned by the current user."
+    }
+  ]
+}

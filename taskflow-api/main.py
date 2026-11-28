@@ -22,9 +22,17 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from database import get_db, init_db
-from deps import get_current_active_user, get_jwt_secret
+from deps import (
+    AUTHENTICATION_ERROR_DETAIL,
+    get_current_active_user,
+    get_jwt_secret,
+)
 from models import Comment, Task, User
-from rate_limit import limiter, rate_limit_exceeded_handler
+from rate_limit import (
+    RATE_LIMIT_ERROR_DETAIL,
+    limiter,
+    rate_limit_exceeded_handler,
+)
 from security import create_access_token, hash_password, verify_password
 
 
@@ -36,7 +44,40 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Taskflow API", lifespan=lifespan)
+app = FastAPI(
+    title="TaskFlow API",
+    version="0.2.0",
+    description=(
+        "Task management REST API with JWT authentication, per-user task "
+        "ownership, filtering, pagination, soft deletion, comments, and a "
+        "database-aware health check."
+    ),
+    openapi_tags=[
+        {
+            "name": "Health",
+            "description": "Unauthenticated API liveness and database readiness.",
+        },
+        {
+            "name": "Authentication",
+            "description": "Registration, login, and the authenticated profile.",
+        },
+        {
+            "name": "Tasks",
+            "description": (
+                "Authenticated task CRUD, filtering, pagination, and soft-delete "
+                "restore. Ownership is taken from the JWT and every query is "
+                "scoped to the current user."
+            ),
+        },
+        {
+            "name": "Comments",
+            "description": (
+                "Authenticated comments on active tasks owned by the current user."
+            ),
+        },
+    ],
+    lifespan=lifespan,
+)
 
 # SlowAPI keeps its limiter on app.state and needs the matching exception
 # handler for RateLimitExceeded. Only decorated routes consume the limit.
@@ -103,6 +144,82 @@ logger = logging.getLogger(__name__)
 DATABASE_ERROR_DETAIL = "Database operation failed"
 OWNERSHIP_ERROR_DETAIL = "Not authorized to access this task"
 
+UNAUTHORIZED_RESPONSE = {
+    "description": "Missing, invalid, expired, or user-less Bearer token.",
+    "content": {
+        "application/json": {
+            "example": {"detail": AUTHENTICATION_ERROR_DETAIL},
+        }
+    },
+}
+FORBIDDEN_RESPONSE = {
+    "description": "The task exists but belongs to another user.",
+    "content": {
+        "application/json": {
+            "example": {"detail": OWNERSHIP_ERROR_DETAIL},
+        }
+    },
+}
+NOT_FOUND_RESPONSE = {
+    "description": "No active task exists with the requested ID.",
+    "content": {
+        "application/json": {
+            "example": {"detail": "Task not found"},
+        }
+    },
+}
+VALIDATION_RESPONSE = {
+    "description": "Request body, query, or path validation failed.",
+    "content": {
+        "application/json": {
+            "example": {
+                "error": "validation_error",
+                "fields": [
+                    {
+                        "field": "title",
+                        "message": "String should have at least 1 character",
+                    }
+                ],
+            }
+        }
+    },
+}
+DATABASE_ERROR_RESPONSE = {
+    "description": "A database operation failed; details are logged server-side.",
+    "content": {
+        "application/json": {
+            "example": {"detail": DATABASE_ERROR_DETAIL},
+        }
+    },
+}
+
+
+class HealthResponse(BaseModel):
+    """Safe health payload; never includes connection details."""
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "status": "healthy",
+                "message": "TaskFlow api is running",
+                "database": "connected",
+            }
+        }
+    )
+
+    status: Literal["healthy", "unhealthy"] = Field(
+        description="Overall API health.",
+        examples=["healthy"],
+    )
+    message: str = Field(
+        description="Human-readable status message.",
+        examples=["TaskFlow api is running"],
+    )
+    database: Literal["connected", "unavailable"] = Field(
+        description="Result of the lightweight database connectivity check.",
+        examples=["connected"],
+    )
+
 
 @app.exception_handler(SQLAlchemyError)
 async def handle_database_error(request: Request, exc: SQLAlchemyError):
@@ -130,7 +247,32 @@ def commit_changes(db: Session) -> None:
         ) from None
 
 
-@app.get("/health")
+@app.get(
+    "/health",
+    response_model=HealthResponse,
+    tags=["Health"],
+    summary="Check API and database health",
+    description=(
+        "Returns API liveness together with a lightweight `SELECT 1` database "
+        "readiness check. This endpoint is unauthenticated and never returns "
+        "connection strings, credentials, or exception details."
+    ),
+    response_description="The API and database are reachable.",
+    responses={
+        503: {
+            "description": "The API is running but the database is unreachable.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "status": "unhealthy",
+                        "message": "TaskFlow api is running",
+                        "database": "unavailable",
+                    }
+                }
+            },
+        }
+    },
+)
 def health(db: DbSession):
     """Report API liveness and database readiness.
 
@@ -166,8 +308,16 @@ def health(db: DbSession):
 
 
 class UserRegister(BaseModel):
-    email: EmailStr
-    password: str = Field(min_length=8, max_length=128)
+    email: EmailStr = Field(
+        description="Account email; stored lowercased and trimmed.",
+        examples=["ada@example.com"],
+    )
+    password: str = Field(
+        min_length=8,
+        max_length=128,
+        description="Plaintext password (8-128 characters), hashed with Argon2id.",
+        examples=["CorrectHorseBatteryStaple!"],
+    )
 
     @field_validator("email")
     @classmethod
@@ -185,14 +335,53 @@ class UserRegister(BaseModel):
 class UserRead(BaseModel):
     """Safe public user representation excluding secrets."""
 
-    model_config = ConfigDict(from_attributes=True)
+    model_config = ConfigDict(
+        from_attributes=True,
+        json_schema_extra={
+            "example": {
+                "id": 1,
+                "email": "ada@example.com",
+                "created_at": "2026-11-28T10:15:00Z",
+            }
+        },
+    )
 
-    id: int
-    email: EmailStr
-    created_at: datetime
+    id: int = Field(description="Stable numeric user ID.", examples=[1])
+    email: EmailStr = Field(
+        description="Account email address.",
+        examples=["ada@example.com"],
+    )
+    created_at: datetime = Field(
+        description="Account creation timestamp.",
+        examples=["2026-11-28T10:15:00Z"],
+    )
 
 
-@app.post("/auth/register", response_model=UserRead, status_code=status.HTTP_201_CREATED)
+@app.post(
+    "/auth/register",
+    response_model=UserRead,
+    status_code=status.HTTP_201_CREATED,
+    tags=["Authentication"],
+    summary="Register a new user",
+    description=(
+        "Creates an account with a unique email and an Argon2id password hash. "
+        "Emails are normalized to lowercase. The response never includes the "
+        "password or password hash."
+    ),
+    response_description="The newly created public user record.",
+    responses={
+        409: {
+            "description": "The email is already registered.",
+            "content": {
+                "application/json": {
+                    "example": {"detail": "Email already registered"},
+                }
+            },
+        },
+        422: VALIDATION_RESPONSE,
+        500: DATABASE_ERROR_RESPONSE,
+    },
+)
 def register(user_in: UserRegister, db: DbSession):
     # Check if email is already registered
     existing_user = db.scalar(select(User).where(User.email == user_in.email))
@@ -233,14 +422,103 @@ def register(user_in: UserRegister, db: DbSession):
 class Token(BaseModel):
     """OAuth2-compatible access-token response; contains no user secrets."""
 
-    access_token: str
-    token_type: str = "bearer"
+    access_token: str = Field(
+        description="Signed HS256 JWT access token.",
+        examples=["eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."],
+    )
+    token_type: str = Field(
+        default="bearer",
+        description="OAuth2 token type.",
+        examples=["bearer"],
+    )
 
 
 LOGIN_ERROR_DETAIL = "Incorrect email or password"
 
 
-@app.post("/auth/login", response_model=Token)
+@app.post(
+    "/auth/login",
+    response_model=Token,
+    tags=["Authentication"],
+    summary="Log in and obtain an access token",
+    description=(
+        "Authenticates an email/password pair using the OAuth2 password form. "
+        "`username` carries the registered email address. Unknown emails and "
+        "wrong passwords return the same generic 401 to prevent account "
+        "enumeration. The endpoint is limited to five requests per minute per "
+        "client IP."
+    ),
+    response_description="A Bearer access token for the authenticated user.",
+    responses={
+        401: {
+            "description": "The email or password is incorrect.",
+            "content": {
+                "application/json": {
+                    "example": {"detail": LOGIN_ERROR_DETAIL},
+                }
+            },
+            "headers": {
+                "WWW-Authenticate": {
+                    "description": "Authentication scheme for the failed request.",
+                    "schema": {"type": "string", "example": "Bearer"},
+                }
+            },
+        },
+        422: VALIDATION_RESPONSE,
+        429: {
+            "description": "The per-IP login rate limit was exceeded.",
+            "content": {
+                "application/json": {
+                    "example": {"detail": RATE_LIMIT_ERROR_DETAIL},
+                }
+            },
+            "headers": {
+                "Retry-After": {
+                    "description": "Seconds to wait before retrying.",
+                    "schema": {"type": "string", "example": "60"},
+                }
+            },
+        },
+        500: {
+            "description": "Server authentication is not configured.",
+            "content": {
+                "application/json": {
+                    "example": {"detail": "Authentication is not configured"},
+                }
+            },
+        },
+    },
+    openapi_extra={
+        "requestBody": {
+            "required": True,
+            "content": {
+                "application/x-www-form-urlencoded": {
+                    "schema": {
+                        "type": "object",
+                        "required": ["username", "password"],
+                        "properties": {
+                            "username": {
+                                "type": "string",
+                                "description": "Registered email address.",
+                                "example": "ada@example.com",
+                            },
+                            "password": {
+                                "type": "string",
+                                "format": "password",
+                                "description": "Account password.",
+                                "example": "CorrectHorseBatteryStaple!",
+                            },
+                        },
+                    },
+                    "example": {
+                        "username": "ada@example.com",
+                        "password": "CorrectHorseBatteryStaple!",
+                    },
+                }
+            },
+        }
+    },
+)
 @limiter.limit("5/minute")
 def login(
     request: Request,
@@ -278,7 +556,18 @@ def login(
     return Token(access_token=access_token, token_type="bearer")
 
 
-@app.get("/auth/me", response_model=UserRead)
+@app.get(
+    "/auth/me",
+    response_model=UserRead,
+    tags=["Authentication"],
+    summary="Get the authenticated user's profile",
+    description=(
+        "Returns the safe public profile associated with the Bearer token. "
+        "No password material is exposed."
+    ),
+    response_description="The authenticated user's public profile.",
+    responses={401: UNAUTHORIZED_RESPONSE},
+)
 def get_me(current_user: Annotated[User, Depends(get_current_active_user)]):
     """Return safe profile data for the authenticated user."""
     return current_user
@@ -303,14 +592,45 @@ def validate_due_date(value: date | None) -> date | None:
 
 
 class TaskCreate(BaseModel):
-    title: str = Field(min_length=1, max_length=TITLE_MAX_LENGTH)
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "title": "Prepare release notes",
+                "description": "Summarize the v0.2.0 changes.",
+                "status": "pending",
+                "due_date": "2026-12-05",
+                "completed": False,
+            }
+        }
+    )
+
+    title: str = Field(
+        min_length=1,
+        max_length=TITLE_MAX_LENGTH,
+        description="Task title, 1-120 characters and not whitespace-only.",
+        examples=["Prepare release notes"],
+    )
     description: str | None = Field(
         default=None,
         max_length=DESCRIPTION_MAX_LENGTH,
+        description="Optional details up to 2,000 characters.",
+        examples=["Summarize the v0.2.0 changes."],
     )
-    status: TaskStatus = TaskStatus.PENDING
-    due_date: date | None = None
-    completed: bool = False
+    status: TaskStatus = Field(
+        default=TaskStatus.PENDING,
+        description="API status; kept consistent with `completed`.",
+        examples=["pending"],
+    )
+    due_date: date | None = Field(
+        default=None,
+        description="Optional due date; must be today or later.",
+        examples=["2026-12-05"],
+    )
+    completed: bool = Field(
+        default=False,
+        description="Completion flag; must agree with `status` when both are sent.",
+        examples=[False],
+    )
 
     @field_validator("title")
     @classmethod
@@ -339,18 +659,44 @@ class TaskCreate(BaseModel):
 
 
 class TaskUpdate(BaseModel):
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "title": "Prepare v0.2.0 release notes",
+                "status": "completed",
+                "completed": True,
+            }
+        }
+    )
+
     title: str | None = Field(
         default=None,
         min_length=1,
         max_length=TITLE_MAX_LENGTH,
+        description="New title; omit to leave unchanged. Explicit null is rejected.",
+        examples=["Prepare v0.2.0 release notes"],
     )
     description: str | None = Field(
         default=None,
         max_length=DESCRIPTION_MAX_LENGTH,
+        description="New details; omit to leave unchanged.",
+        examples=["Updated release checklist."],
     )
-    status: TaskStatus | None = None
-    due_date: date | None = None
-    completed: bool | None = None
+    status: TaskStatus | None = Field(
+        default=None,
+        description="New API status; omit to leave unchanged. Explicit null is rejected.",
+        examples=["completed"],
+    )
+    due_date: date | None = Field(
+        default=None,
+        description="New due date; must be today or later when provided.",
+        examples=["2026-12-10"],
+    )
+    completed: bool | None = Field(
+        default=None,
+        description="New completion flag; omit to leave unchanged.",
+        examples=[True],
+    )
 
     @field_validator("title")
     @classmethod
@@ -396,15 +742,46 @@ class TaskUpdate(BaseModel):
 class TaskRead(BaseModel):
     """Response shape for a task, including its database-generated timestamp."""
 
-    model_config = ConfigDict(from_attributes=True)
+    model_config = ConfigDict(
+        from_attributes=True,
+        json_schema_extra={
+            "example": {
+                "id": 42,
+                "title": "Prepare release notes",
+                "description": "Summarize the v0.2.0 changes.",
+                "status": "pending",
+                "completed": False,
+                "due_date": "2026-12-05",
+                "created_at": "2026-11-28T10:15:00Z",
+            }
+        },
+    )
 
-    id: int
-    title: str
-    description: str | None
-    status: TaskStatus
-    completed: bool
-    due_date: date | None
-    created_at: datetime
+    id: int = Field(description="Stable task ID.", examples=[42])
+    title: str = Field(
+        description="Task title.",
+        examples=["Prepare release notes"],
+    )
+    description: str | None = Field(
+        description="Optional task details.",
+        examples=["Summarize the v0.2.0 changes."],
+    )
+    status: TaskStatus = Field(
+        description="Derived API status.",
+        examples=["pending"],
+    )
+    completed: bool = Field(
+        description="Persisted completion flag.",
+        examples=[False],
+    )
+    due_date: date | None = Field(
+        description="Optional due date.",
+        examples=["2026-12-05"],
+    )
+    created_at: datetime = Field(
+        description="Database-generated creation timestamp.",
+        examples=["2026-11-28T10:15:00Z"],
+    )
 
 
 COMMENT_BODY_MAX_LENGTH = 2000
@@ -413,7 +790,18 @@ COMMENT_BODY_MAX_LENGTH = 2000
 class CommentCreate(BaseModel):
     """Comment input; ownership and the parent task come from auth and the URL."""
 
-    body: str = Field(min_length=1, max_length=COMMENT_BODY_MAX_LENGTH)
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {"body": "Confirmed on staging; looks good to ship."}
+        }
+    )
+
+    body: str = Field(
+        min_length=1,
+        max_length=COMMENT_BODY_MAX_LENGTH,
+        description="Comment text, 1-2,000 characters and not whitespace-only.",
+        examples=["Confirmed on staging; looks good to ship."],
+    )
 
     @field_validator("body")
     @classmethod
@@ -426,13 +814,30 @@ class CommentCreate(BaseModel):
 class CommentRead(BaseModel):
     """Safe public representation of a comment."""
 
-    model_config = ConfigDict(from_attributes=True)
+    model_config = ConfigDict(
+        from_attributes=True,
+        json_schema_extra={
+            "example": {
+                "id": 7,
+                "task_id": 42,
+                "author_id": 1,
+                "body": "Confirmed on staging; looks good to ship.",
+                "created_at": "2026-11-28T10:20:00Z",
+            }
+        },
+    )
 
-    id: int
-    task_id: int
-    author_id: int
-    body: str
-    created_at: datetime
+    id: int = Field(description="Stable comment ID.", examples=[7])
+    task_id: int = Field(description="Parent task ID.", examples=[42])
+    author_id: int = Field(description="Author user ID.", examples=[1])
+    body: str = Field(
+        description="Comment text.",
+        examples=["Confirmed on staging; looks good to ship."],
+    )
+    created_at: datetime = Field(
+        description="Database-generated creation timestamp.",
+        examples=["2026-11-28T10:20:00Z"],
+    )
 
 
 def get_owned_task(
@@ -482,17 +887,96 @@ def escape_like_pattern(value: str) -> str:
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
-@app.get("/tasks", response_model=list[TaskRead])
+@app.get(
+    "/tasks",
+    response_model=list[TaskRead],
+    tags=["Tasks"],
+    summary="List, filter, search, sort, and paginate owned tasks",
+    description=(
+        "Returns only tasks owned by the authenticated user, excluding "
+        "soft-deleted tasks. Filters, case-insensitive title search, sorting, "
+        "counting, and pagination all run in the database. Pagination metadata "
+        "is returned in `X-Total-Count`, `X-Limit`, and `X-Offset` headers."
+    ),
+    response_description="The requested page of owned tasks.",
+    responses={
+        200: {
+            "description": "Owned tasks matching the filters and page window.",
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "array",
+                        "items": {"$ref": "#/components/schemas/TaskRead"},
+                    },
+                    "example": [
+                        {
+                            "id": 42,
+                            "title": "Prepare release notes",
+                            "description": "Summarize the v0.2.0 changes.",
+                            "status": "pending",
+                            "completed": False,
+                            "due_date": "2026-12-05",
+                            "created_at": "2026-11-28T10:15:00Z",
+                        }
+                    ],
+                }
+            },
+            "headers": {
+                "X-Total-Count": {
+                    "description": "Filtered task count before limit/offset.",
+                    "schema": {"type": "integer"},
+                },
+                "X-Limit": {
+                    "description": "Maximum tasks in this response.",
+                    "schema": {"type": "integer"},
+                },
+                "X-Offset": {
+                    "description": "Number of matching tasks skipped.",
+                    "schema": {"type": "integer"},
+                },
+            },
+        },
+        401: UNAUTHORIZED_RESPONSE,
+        422: VALIDATION_RESPONSE,
+        500: DATABASE_ERROR_RESPONSE,
+    },
+)
 def get_tasks(
     db: DbSession,
     current_user: CurrentUser,
     response: Response,
-    completed: bool | None = None,
-    search: Annotated[str | None, Query(min_length=1, max_length=100)] = None,
-    sort_by: SortField = "id",
-    sort_order: SortOrder = "asc",
-    limit: Annotated[int, Query(ge=1, le=MAX_PAGE_LIMIT)] = DEFAULT_PAGE_LIMIT,
-    offset: Annotated[int, Query(ge=0)] = 0,
+    completed: Annotated[
+        bool | None,
+        Query(description="Filter by completion state; omit for all tasks."),
+    ] = None,
+    search: Annotated[
+        str | None,
+        Query(
+            min_length=1,
+            max_length=100,
+            description="Case-insensitive title substring; wildcards are literal.",
+        ),
+    ] = None,
+    sort_by: Annotated[
+        SortField,
+        Query(description="Column to sort by."),
+    ] = "id",
+    sort_order: Annotated[
+        SortOrder,
+        Query(description="Sort direction; ties are broken by ascending ID."),
+    ] = "asc",
+    limit: Annotated[
+        int,
+        Query(
+            ge=1,
+            le=MAX_PAGE_LIMIT,
+            description="Page size (1-100).",
+        ),
+    ] = DEFAULT_PAGE_LIMIT,
+    offset: Annotated[
+        int,
+        Query(ge=0, description="Number of matching tasks to skip."),
+    ] = 0,
 ):
     # Ownership is part of every query, including the count, so users can never
     # observe another user's tasks through listing, search, or pagination.
@@ -536,7 +1020,24 @@ def get_tasks(
     return tasks
 
 
-@app.post("/tasks", response_model=TaskRead, status_code=201)
+@app.post(
+    "/tasks",
+    response_model=TaskRead,
+    status_code=201,
+    tags=["Tasks"],
+    summary="Create a task",
+    description=(
+        "Creates a task owned by the authenticated user. Ownership always comes "
+        "from the verified JWT, never the request body. Status and `completed` "
+        "must agree when both are supplied."
+    ),
+    response_description="The newly created task.",
+    responses={
+        401: UNAUTHORIZED_RESPONSE,
+        422: VALIDATION_RESPONSE,
+        500: DATABASE_ERROR_RESPONSE,
+    },
+)
 def create_task(task: TaskCreate, db: DbSession, current_user: CurrentUser):
     # Ownership always comes from the verified token, never the request body.
     new_task = Task(
@@ -552,12 +1053,47 @@ def create_task(task: TaskCreate, db: DbSession, current_user: CurrentUser):
     return new_task
 
 
-@app.get("/tasks/{task_id}", response_model=TaskRead)
+@app.get(
+    "/tasks/{task_id}",
+    response_model=TaskRead,
+    tags=["Tasks"],
+    summary="Get one owned task",
+    description=(
+        "Returns a single active task when it belongs to the authenticated user. "
+        "Soft-deleted tasks are treated as missing."
+    ),
+    response_description="The requested owned task.",
+    responses={
+        401: UNAUTHORIZED_RESPONSE,
+        403: FORBIDDEN_RESPONSE,
+        404: NOT_FOUND_RESPONSE,
+        422: VALIDATION_RESPONSE,
+        500: DATABASE_ERROR_RESPONSE,
+    },
+)
 def get_task(task_id: int, db: DbSession, current_user: CurrentUser):
     return get_owned_task(db, task_id, current_user)
 
 
-@app.patch("/tasks/{task_id}", response_model=TaskRead)
+@app.patch(
+    "/tasks/{task_id}",
+    response_model=TaskRead,
+    tags=["Tasks"],
+    summary="Partially update an owned task",
+    description=(
+        "Updates only the supplied fields on an active task owned by the "
+        "authenticated user. Omitted fields are unchanged; explicit JSON null "
+        "is rejected for non-nullable fields. Ownership cannot be changed."
+    ),
+    response_description="The updated task.",
+    responses={
+        401: UNAUTHORIZED_RESPONSE,
+        403: FORBIDDEN_RESPONSE,
+        404: NOT_FOUND_RESPONSE,
+        422: VALIDATION_RESPONSE,
+        500: DATABASE_ERROR_RESPONSE,
+    },
+)
 def update_task(
     task_id: int,
     update: TaskUpdate,
@@ -580,7 +1116,25 @@ def update_task(
     return task
 
 
-@app.delete("/tasks/{task_id}", status_code=204)
+@app.delete(
+    "/tasks/{task_id}",
+    status_code=204,
+    tags=["Tasks"],
+    summary="Soft-delete an owned task",
+    description=(
+        "Marks an active task owned by the authenticated user as deleted by "
+        "setting `deleted_at`. The row is retained so restore is possible. "
+        "Repeating the delete returns 404 and does not overwrite the timestamp."
+    ),
+    response_description="The task was soft-deleted; the response has no body.",
+    responses={
+        401: UNAUTHORIZED_RESPONSE,
+        403: FORBIDDEN_RESPONSE,
+        404: NOT_FOUND_RESPONSE,
+        422: VALIDATION_RESPONSE,
+        500: DATABASE_ERROR_RESPONSE,
+    },
+)
 def delete_task(task_id: int, db: DbSession, current_user: CurrentUser):
     """Soft-delete an owned, active task.
 
@@ -593,7 +1147,25 @@ def delete_task(task_id: int, db: DbSession, current_user: CurrentUser):
     commit_changes(db)
 
 
-@app.post("/tasks/{task_id}/restore", response_model=TaskRead)
+@app.post(
+    "/tasks/{task_id}/restore",
+    response_model=TaskRead,
+    tags=["Tasks"],
+    summary="Restore a soft-deleted owned task",
+    description=(
+        "Clears `deleted_at` on a task owned by the authenticated user. Restore "
+        "is idempotent: an already-active task is returned unchanged. Another "
+        "user's task returns 403; an unknown ID returns 404."
+    ),
+    response_description="The restored or already-active task.",
+    responses={
+        401: UNAUTHORIZED_RESPONSE,
+        403: FORBIDDEN_RESPONSE,
+        404: NOT_FOUND_RESPONSE,
+        422: VALIDATION_RESPONSE,
+        500: DATABASE_ERROR_RESPONSE,
+    },
+)
 def restore_task(task_id: int, db: DbSession, current_user: CurrentUser):
     """Restore an owned, soft-deleted task by clearing ``deleted_at``.
 
@@ -613,6 +1185,21 @@ def restore_task(task_id: int, db: DbSession, current_user: CurrentUser):
     "/tasks/{task_id}/comments",
     response_model=CommentRead,
     status_code=status.HTTP_201_CREATED,
+    tags=["Comments"],
+    summary="Add a comment to an owned task",
+    description=(
+        "Creates a comment on an active task owned by the authenticated user. "
+        "The author always comes from the JWT; task access checks reject "
+        "missing or deleted tasks with 404 and other users' tasks with 403."
+    ),
+    response_description="The newly created comment.",
+    responses={
+        401: UNAUTHORIZED_RESPONSE,
+        403: FORBIDDEN_RESPONSE,
+        404: NOT_FOUND_RESPONSE,
+        422: VALIDATION_RESPONSE,
+        500: DATABASE_ERROR_RESPONSE,
+    },
 )
 def create_comment(
     task_id: int,
@@ -635,14 +1222,76 @@ def create_comment(
     return new_comment
 
 
-@app.get("/tasks/{task_id}/comments", response_model=list[CommentRead])
+@app.get(
+    "/tasks/{task_id}/comments",
+    response_model=list[CommentRead],
+    tags=["Comments"],
+    summary="List an owned task's comments",
+    description=(
+        "Returns comments for an active task owned by the authenticated user, "
+        "newest first, with offset pagination. Pagination metadata is returned "
+        "in `X-Total-Count`, `X-Limit`, and `X-Offset` headers."
+    ),
+    response_description="The requested page of comments, newest first.",
+    responses={
+        200: {
+            "description": "Comments for the owned task, newest first.",
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "array",
+                        "items": {"$ref": "#/components/schemas/CommentRead"},
+                    },
+                    "example": [
+                        {
+                            "id": 7,
+                            "task_id": 42,
+                            "author_id": 1,
+                            "body": "Confirmed on staging; looks good to ship.",
+                            "created_at": "2026-11-28T10:20:00Z",
+                        }
+                    ],
+                }
+            },
+            "headers": {
+                "X-Total-Count": {
+                    "description": "Total comments on the task before limit/offset.",
+                    "schema": {"type": "integer"},
+                },
+                "X-Limit": {
+                    "description": "Maximum comments in this response.",
+                    "schema": {"type": "integer"},
+                },
+                "X-Offset": {
+                    "description": "Number of comments skipped.",
+                    "schema": {"type": "integer"},
+                },
+            },
+        },
+        401: UNAUTHORIZED_RESPONSE,
+        403: FORBIDDEN_RESPONSE,
+        404: NOT_FOUND_RESPONSE,
+        422: VALIDATION_RESPONSE,
+        500: DATABASE_ERROR_RESPONSE,
+    },
+)
 def get_task_comments(
     task_id: int,
     db: DbSession,
     current_user: CurrentUser,
     response: Response,
-    limit: Annotated[int, Query(ge=1, le=MAX_PAGE_LIMIT)] = DEFAULT_PAGE_LIMIT,
-    offset: Annotated[int, Query(ge=0)] = 0,
+    limit: Annotated[
+        int,
+        Query(
+            ge=1,
+            le=MAX_PAGE_LIMIT,
+            description="Page size (1-100).",
+        ),
+    ] = DEFAULT_PAGE_LIMIT,
+    offset: Annotated[
+        int,
+        Query(ge=0, description="Number of comments to skip."),
+    ] = 0,
 ):
     """List an active task's comments, newest first, using offset pagination."""
     task = get_owned_task(db, task_id, current_user)
